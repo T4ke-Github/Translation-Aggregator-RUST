@@ -1,0 +1,38 @@
+# Google Translate - public web endpoint (UNOFFICIAL, no API key)
+#
+# Draft definition for the planned web connector. Field names may change
+# until the format is frozen; see docs/guides/custom-web-services.md.
+#
+# This uses the keyless endpoint that Google's own web widgets call. It is not
+# a supported API: it can change or stop working without notice, it is
+# rate-limited, and automated use may be against Google's terms of service.
+# Use it at your own risk. For reliable use, prefer the built-in
+# "Google Cloud Translation" preset (official API, free monthly allowance).
+
+[provider]
+id = "google-web-unofficial"
+name = "Google (web, unofficial)"
+enabled = false            # opt in explicitly in Settings > Translators
+unofficial = true          # shows an "unofficial" badge and a warning in the UI
+auto_translate = false     # don't send every clipboard change automatically
+max_chars = 1500           # longer text is split at sentence ends; one over-long sentence is refused
+rate_limit = { requests = 20, per_seconds = 60 }
+website = "https://translate.google.com/"
+
+[languages]
+# App language code -> code the service expects. Codes not listed are passed through.
+auto = "auto"
+map = { "zh-Hans" = "zh-CN", "zh-Hant" = "zh-TW" }
+
+[request]
+method = "POST"
+url = "https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl={{src}}&tl={{dst}}"
+# Form values are URL-encoded automatically.
+body.form = { q = "{{text}}" }
+
+[response]
+# The reply is a nested JSON array; element [0] holds one entry per sentence,
+# and each entry starts with the translated sentence. Join them in order.
+text = { jsonpath = "$[0][*][0]", join = "" }
+
+# Last checked against the live service: 2026-11-08 (ja -> en).

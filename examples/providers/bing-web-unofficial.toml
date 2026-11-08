@@ -1,0 +1,60 @@
+# Bing Translator - public web endpoint (UNOFFICIAL, no API key)
+#
+# Draft definition for the planned web connector. Field names may change
+# until the format is frozen; see docs/guides/custom-web-services.md.
+#
+# This uses the endpoint behind the bing.com/translator web page. It is not a
+# supported API: page markup and parameters change without notice, requests
+# are rate-limited, and automated use may be against Microsoft's terms of
+# service. Use it at your own risk. For reliable use, prefer the built-in
+# "Microsoft Translator" preset (official API behind Bing, free monthly allowance).
+
+[provider]
+id = "bing-web-unofficial"
+name = "Bing (web, unofficial)"
+enabled = false
+unofficial = true
+auto_translate = false
+max_chars = 1000
+rate_limit = { requests = 10, per_seconds = 60 }
+website = "https://www.bing.com/translator"
+
+[languages]
+auto = "auto-detect"
+map = { "zh-Hans" = "zh-Hans", "zh-Hant" = "zh-Hant", "pt" = "pt" }
+
+# Session step: load the translator page once, pull the values the page uses
+# for its own requests, and reuse them (and the cookies) for later requests.
+[session]
+request = { method = "GET", url = "https://www.bing.com/translator" }
+keep_cookies = true
+refresh_after_uses = 100        # get fresh values after 100 translations
+refresh_after_seconds = 3000    # or after 50 minutes
+refresh_on_status = [400, 401, 403, 429]
+
+[session.extract]
+# Each entry is a regex; the first capture group becomes {{session.<name>}}.
+# If a regex stops matching, the page markup changed: open the page in a
+# browser, view its source, and update the pattern (see the guide).
+ig    = { regex = 'IG:"([0-9A-Fa-f]+)"' }
+iid   = { regex = 'data-iid="([^"]+)"' }
+key   = { regex = 'params_AbusePreventionHelper\s*=\s*\[(\d+),' }
+token = { regex = 'params_AbusePreventionHelper\s*=\s*\[\d+,"([^"]+)"' }
+
+[request]
+method = "POST"
+# {{counter}} counts requests made with the current session (1, 2, 3, ...).
+url = "https://www.bing.com/ttranslatev3?isVertical=1&IG={{session.ig}}&IID={{session.iid}}.{{counter}}"
+headers = { Referer = "https://www.bing.com/translator" }
+body.form = { fromLang = "{{src}}", to = "{{dst}}", text = "{{text}}", token = "{{session.token}}", key = "{{session.key}}" }
+
+[response]
+text  = { jsonpath = "$[0].translations[0].text" }
+# On failure Bing returns an object instead of an array: either an error
+# message, or {"ShowCaptcha": ...} when it rejected the request (stale session
+# values, missing cookies, or too many requests). A reply without
+# translations triggers a session refresh and one retry.
+error = { jsonpath = "$.errorMessage" }
+refresh_session_if = { jsonpath = "$.ShowCaptcha" }
+
+# Last checked against the live service: 2026-11-08 (ja -> en, both "ja" and "auto-detect").

@@ -1,0 +1,715 @@
+<title>Translation Aggregator Spec Tracker</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap">
+<style>
+  /* Layout: one column of stacked panels (summary, milestones, areas), then a two-pane
+     feature / criteria workbench that stacks on narrow screens. Indigo ink on cool paper. */
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --fg: #1b2230;
+    --muted: #5a6476;
+    --line: #dde1e8;
+    --track: #e9ecf1;
+    --accent: #2f4b8a;
+    --accent-soft: #e6ebf6;
+    --ok: #23784a;
+    --ok-soft: #e3f2e9;
+    --bad: #b3261e;
+    --bad-soft: #fbe7e5;
+    --warn: #8a5a00;
+    --focus: #2f4b8a;
+    --font-display: "Zen Kaku Gothic New", "Yu Gothic", "Hiragino Sans", "Segoe UI", sans-serif;
+    --font-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --radius: 6px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11141a; --panel: #191d25; --fg: #e6e9ef; --muted: #9aa3b2; --line: #2b313c; --track: #252a34;
+      --accent: #93acea; --accent-soft: #233050; --ok: #5cc48a; --ok-soft: #173326; --bad: #f08a80; --bad-soft: #3b1d1b;
+      --warn: #e2b04a; --focus: #93acea; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #11141a; --panel: #191d25; --fg: #e6e9ef; --muted: #9aa3b2; --line: #2b313c; --track: #252a34;
+    --accent: #93acea; --accent-soft: #233050; --ok: #5cc48a; --ok-soft: #173326; --bad: #f08a80; --bad-soft: #3b1d1b;
+    --warn: #e2b04a; --focus: #93acea; color-scheme: dark;
+  }
+
+  body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 14px; line-height: 1.5; }
+  .page { max-width: 1320px; margin-inline: auto; padding-block: 28px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: flex; flex-direction: column; gap: 28px; }
+  h1, h2, h3 { margin: 0; text-wrap: balance; }
+  h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.1rem); letter-spacing: .01em; }
+  h2 { font-family: var(--font-display); font-weight: 700; font-size: 1.15rem; }
+  h3 { font-size: 1rem; font-weight: 600; }
+  .eyebrow { margin: 0 0 6px; font-family: var(--font-mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .lede { margin: 8px 0 0; max-width: 75ch; color: var(--muted); }
+  .lede b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .note { margin: 2px 0 14px; color: var(--muted); font-size: 13px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .mono { font-family: var(--font-mono); }
+
+  .banner { border: 1px solid var(--line); border-left: 3px solid var(--warn); background: var(--panel); border-radius: var(--radius); padding: 10px 14px; color: var(--fg); }
+  .banner.is-bad { border-left-color: var(--bad); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 12px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+  .tile-label { margin: 0; font-size: 12px; color: var(--muted); letter-spacing: .02em; }
+  .tile-value { display: block; margin-top: 4px; font-family: var(--font-display); font-weight: 500; font-size: 1.9rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .tile-value.is-ok { color: var(--ok); }
+  .tile-value.is-bad { color: var(--bad); }
+  .tile-sub { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; min-width: 0; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; align-items: start; }
+
+  /* Milestone ladder */
+  .ladder { display: flex; flex-direction: column; }
+  .rung { display: grid; grid-template-columns: 3.2rem minmax(0, 9rem) minmax(0, 1fr) auto; gap: 4px 14px; align-items: center; padding: 9px 6px; border-top: 1px solid var(--line); cursor: pointer; border-radius: 4px; background: none; border-left: 0; border-right: 0; border-bottom: 0; font: inherit; color: inherit; text-align: left; width: 100%; }
+  .rung:first-child { border-top: 0; }
+  .rung:hover { background: var(--accent-soft); }
+  .rung.is-picked { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+  .rung-id { font-family: var(--font-mono); font-weight: 500; }
+  .rung-name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rung-meta { grid-column: 3 / 5; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar { display: flex; height: 10px; border-radius: 3px; background: var(--track); overflow: hidden; min-width: 60px; }
+  .bar span { display: block; height: 100%; }
+  .bar .b-ok { background: var(--ok); }
+  .bar .b-bad { background: var(--bad); }
+  .bar.is-small { height: 8px; width: 7rem; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; border: 1px solid var(--line); color: var(--muted); }
+  .chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line); }
+  .chip.is-done { color: var(--ok); border-color: currentColor; }
+  .chip.is-done::before { background: var(--ok); }
+  .chip.is-failing { color: var(--bad); border-color: currentColor; }
+  .chip.is-failing::before { background: var(--bad); }
+  .chip.is-progress { color: var(--accent); border-color: currentColor; }
+  .chip.is-progress::before { background: var(--accent); }
+  .chip.is-empty { border-style: dashed; }
+  .chip.is-empty::before { display: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 0 0 8px; padding: 0; list-style: none; font-size: 12px; color: var(--muted); }
+  .legend li { display: flex; align-items: center; gap: 6px; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; background: var(--track); border: 1px solid var(--line); }
+  .sw.ok { background: var(--ok); border-color: var(--ok); }
+  .sw.bad { background: var(--bad); border-color: var(--bad); }
+
+  /* Check methods */
+  .checks { display: flex; flex-direction: column; gap: 6px; }
+  .check-row { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) 3rem; gap: 10px; align-items: center; padding: 4px 6px; border-radius: 4px; cursor: pointer; background: none; border: 0; font: inherit; color: inherit; text-align: left; width: 100%; }
+  .check-row:hover { background: var(--accent-soft); }
+  .check-row.is-picked { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+  .check-row .mono { font-size: 13px; }
+  .check-row .num { text-align: right; }
+
+  /* Tables */
+  .scroll { overflow: auto; max-height: 38rem; margin-inline: -6px; }
+  .scroll.is-short { max-height: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { position: sticky; top: 0; z-index: 1; background: var(--panel); text-align: left; font-weight: 500; color: var(--muted); padding: 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.r, th.r { text-align: right; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--accent-soft); }
+  tr.is-picked td { background: var(--accent-soft); }
+  tr.is-picked td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  .id { font-family: var(--font-mono); font-weight: 500; white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .pill { display: inline-block; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; font-size: 12px; line-height: 1.7; color: var(--muted); }
+  .pill.is-must { color: var(--fg); border-color: var(--fg); }
+  .pill.is-passed { color: var(--ok); border-color: currentColor; background: var(--ok-soft); }
+  .pill.is-failed { color: var(--bad); border-color: currentColor; background: var(--bad-soft); }
+  .pill.is-progress { color: var(--accent); border-color: currentColor; }
+
+  /* Filters */
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .filters input, .filters select { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; min-width: 0; }
+  .filters input { flex: 1 1 16rem; }
+  .btn { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; cursor: pointer; }
+  .btn:hover { border-color: var(--muted); }
+  .btn.is-chip { border-color: var(--accent); color: var(--accent); }
+  .shown { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  :is(input, select, button, tr[tabindex]):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  .workbench { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 16px; align-items: start; }
+  @media (max-width: 980px) { .workbench { grid-template-columns: minmax(0, 1fr); } }
+
+  /* Criterion rows */
+  .crit-text { min-width: 14rem; line-height: 1.5; }
+  .crit-meta { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12px; color: var(--muted); }
+  .crit-note { flex: 1 1 14rem; min-width: 0; font: inherit; font-size: 12px; color: var(--fg); background: transparent; border: 1px dashed var(--line); border-radius: 4px; padding: 3px 7px; }
+  .crit-note:focus { border-style: solid; }
+  .crit-note-ro { color: var(--fg); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .seg button { font: inherit; font-size: 12px; padding: 4px 9px; border: 0; border-left: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .seg button:first-child { border-left: 0; }
+  .seg button:hover:not(:disabled) { color: var(--fg); }
+  .seg button[aria-checked="true"] { color: var(--fg); background: var(--track); font-weight: 500; }
+  .seg button[data-set="passed"][aria-checked="true"] { color: var(--ok); background: var(--ok-soft); }
+  .seg button[data-set="failed"][aria-checked="true"] { color: var(--bad); background: var(--bad-soft); }
+  .seg button:disabled { cursor: default; opacity: .6; }
+  .seg.is-pending { opacity: .55; }
+  .empty { margin: 12px 0 0; color: var(--muted); }
+
+  details.about summary { cursor: pointer; color: var(--muted); }
+  details.about dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 12px 0 0; font-size: 13px; }
+  details.about dt { font-weight: 600; }
+  details.about dd { margin: 0; color: var(--muted); }
+  @media (max-width: 520px) {
+    .rung { grid-template-columns: 2.8rem minmax(0, 1fr) auto; }
+    .rung-name { display: none; }
+    .rung-meta { grid-column: 2 / 4; }
+    details.about dl { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .bar span { transition: width .3s ease-out; }
+  }
+</style>
+
+<script type="application/json" id="spec-data">__SPEC_DATA__</script>
+
+<div class="page">
+  <header>
+    <p class="eyebrow">Translation-Aggregator-RUST · design specs</p>
+    <h1>Spec tracker</h1>
+    <p class="lede" id="lede">Loading the specs…</p>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="tiles" aria-label="Totals">
+    <div class="tile"><p class="tile-label">Features</p><span class="tile-value" id="t-features">—</span><p class="tile-sub" id="t-features-sub">&nbsp;</p></div>
+    <div class="tile"><p class="tile-label">Acceptance criteria</p><span class="tile-value" id="t-criteria">—</span><p class="tile-sub" id="t-criteria-sub">&nbsp;</p></div>
+    <div class="tile"><p class="tile-label">Passed</p><span class="tile-value is-ok" id="t-passed">—</span><p class="tile-sub" id="t-passed-sub">&nbsp;</p></div>
+    <div class="tile"><p class="tile-label">Failed</p><span class="tile-value is-bad" id="t-failed">—</span><p class="tile-sub" id="t-failed-sub">&nbsp;</p></div>
+    <div class="tile"><p class="tile-label">Milestones done</p><span class="tile-value" id="t-ms">—</span><p class="tile-sub" id="t-ms-sub">&nbsp;</p></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="panel" aria-labelledby="ms-title">
+      <h2 id="ms-title">Milestones</h2>
+      <p class="note">A milestone is done when all its Must criteria have passed. Click one to filter the lists.</p>
+      <ul class="legend" aria-hidden="true">
+        <li><span class="sw ok"></span>Passed</li>
+        <li><span class="sw bad"></span>Failed</li>
+        <li><span class="sw"></span>Not started</li>
+      </ul>
+      <div class="ladder" id="ladder"></div>
+    </section>
+
+    <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+      <section class="panel" aria-labelledby="areas-title">
+        <h2 id="areas-title">Spec areas</h2>
+        <p class="note">One spec file per area. Click a row to filter the lists.</p>
+        <div class="scroll is-short">
+          <table>
+            <thead><tr><th>Area</th><th>Spec</th><th class="r">Features</th><th class="r">Criteria</th><th>Progress</th></tr></thead>
+            <tbody id="areas"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="checks-title">
+        <h2 id="checks-title">How criteria are checked</h2>
+        <p class="note">Criteria per verification method. Click one to filter.</p>
+        <div class="checks" id="checks"></div>
+      </section>
+    </div>
+  </div>
+
+  <section aria-labelledby="wb-title" style="display:flex;flex-direction:column;gap:12px">
+    <h2 id="wb-title">Features and acceptance criteria</h2>
+    <div class="filters">
+      <input id="f-q" type="search" placeholder="Search IDs, titles and criteria" aria-label="Search features and criteria">
+      <select id="f-milestone" aria-label="Milestone"></select>
+      <select id="f-area" aria-label="Spec area"></select>
+      <select id="f-priority" aria-label="Priority">
+        <option value="">All priorities</option><option value="Must">Must</option><option value="Should">Should</option><option value="Could">Could</option>
+      </select>
+      <select id="f-verify" aria-label="Verification method"></select>
+      <select id="f-status" aria-label="Criterion status">
+        <option value="">All statuses</option><option value="none">Not started</option><option value="passed">Passed</option><option value="failed">Failed</option>
+      </select>
+      <button class="btn is-chip" id="f-feature" type="button" hidden></button>
+      <button class="btn" id="f-clear" type="button">Clear filters</button>
+      <span class="shown" id="shown" aria-live="polite"></span>
+    </div>
+
+    <div class="workbench">
+      <div class="panel">
+        <h3>Features</h3>
+        <p class="note">Click a feature to show only its criteria. Its status comes from its criteria.</p>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>ID</th><th>Feature</th><th>Priority</th><th>Milestone</th><th class="r">Passed</th><th>Status</th></tr></thead>
+            <tbody id="features"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="features-empty" hidden>No features match these filters.</p>
+      </div>
+      <div class="panel">
+        <h3 id="crit-title">Acceptance criteria</h3>
+        <p class="note" id="crit-note">For the features in the list. Set each criterion to Passed or Failed when it has been checked.</p>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>ID</th><th>Criterion</th><th>Check</th><th>Status</th></tr></thead>
+            <tbody id="criteria"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="criteria-empty" hidden>No criteria match these filters.</p>
+      </div>
+    </div>
+  </section>
+
+  <details class="about">
+    <summary>About this tracker</summary>
+    <dl>
+      <dt>Source</dt><dd id="about-source">The spec files in docs/specs of the repository.</dd>
+      <dt>Status</dt><dd>Each acceptance criterion is Not started, Passed or Failed. Everyone who can open this page sees changes live; people with Contributor access or higher can change them. The page records who set a status and when.</dd>
+      <dt>Feature status</dt><dd>Passed when all its criteria passed, Failed when any failed, In progress when some passed, otherwise Not started.</dd>
+      <dt>Milestone</dt><dd>Done when all its Must criteria passed. Failing when a Must criterion failed.</dd>
+      <dt>Priority</dt><dd>Must is needed for its milestone. Should can slip one milestone. Could is nice to have.</dd>
+      <dt>Check</dt><dd>unit, integration, contract (recorded responses or a mock server), parity (compared with the old app), security, CI, or manual (a written walkthrough).</dd>
+      <dt>Left out</dt><dd>Withdrawn features and criteria. The hook plugin spec (HOOK, milestone M7) is a placeholder with no criteria yet.</dd>
+    </dl>
+  </details>
+</div>
+
+<script>
+(() => {
+  const SPEC = JSON.parse(document.getElementById('spec-data').textContent);
+  const MILESTONES = [
+    ['M0', 'Scaffolding'], ['M1', 'Core'], ['M2', 'GUI'], ['M3', 'LLM'], ['M4', 'Japanese tools'],
+    ['M5', 'Local API'], ['M6', 'Plugins'], ['M7', 'Hook plugin'], ['M8', 'Release'],
+  ];
+  const VERIFY_ORDER = ['unit', 'integration', 'contract', 'parity', 'security', 'CI', 'manual'];
+  const fmt = new Intl.NumberFormat('en');
+  const pct = new Intl.NumberFormat('en', {style: 'percent', maximumFractionDigits: 1});
+  const dateFmt = new Intl.DateTimeFormat('en', {month: 'short', day: 'numeric', year: 'numeric'});
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+  const features = SPEC.features.filter((f) => !f.withdrawn);
+  const featureIds = new Set(features.map((f) => f.id));
+  const criteria = SPEC.criteria.filter((c) => !c.withdrawn && featureIds.has(c.feature));
+  const featById = new Map(features.map((f) => [f.id, f]));
+  const critByFeature = new Map();
+  criteria.forEach((c) => { if (!critByFeature.has(c.feature)) critByFeature.set(c.feature, []); critByFeature.get(c.feature).push(c); });
+
+  // ---- State -------------------------------------------------------------
+  const S = {
+    db: null, user: null, uid: null,
+    dbState: 'loading',            // loading | ok | unavailable | error
+    canWrite: null,                // true | false | null (not told)
+    statuses: new Map(),           // criterion id -> {status, by, at, note}
+    pending: new Set(),
+    names: {},
+  };
+  const F = {q: '', milestone: '', area: '', priority: '', verify: '', status: '', feature: ''};
+
+  const statusOf = (id) => { const s = S.statuses.get(id); return s ? s.status : 'none'; };
+  const clean = (d) => {
+    if (!d || (d.status !== 'passed' && d.status !== 'failed')) return null;
+    return {
+      status: d.status,
+      by: typeof d.by === 'string' ? d.by : null,
+      at: typeof d.at === 'string' ? d.at : null,
+      note: typeof d.note === 'string' ? d.note.slice(0, 500) : '',
+    };
+  };
+
+  // ---- Derived numbers ---------------------------------------------------
+  const tally = (list) => {
+    let passed = 0, failed = 0;
+    list.forEach((c) => { const s = statusOf(c.id); if (s === 'passed') passed++; else if (s === 'failed') failed++; });
+    return {total: list.length, passed, failed, none: list.length - passed - failed};
+  };
+  const featureStatus = (f) => {
+    const t = tally(critByFeature.get(f.id) || []);
+    if (!t.total) return 'nocrit';
+    if (t.failed) return 'failed';
+    if (t.passed === t.total) return 'passed';
+    if (t.passed) return 'progress';
+    return 'none';
+  };
+  const milestoneState = (m) => {
+    const must = criteria.filter((c) => featById.get(c.feature).milestone === m && featById.get(c.feature).priority === 'Must');
+    const all = criteria.filter((c) => featById.get(c.feature).milestone === m);
+    const tm = tally(must);
+    if (!all.length) return 'empty';
+    if (tm.failed) return 'failing';
+    if (tm.total && tm.passed === tm.total) return 'done';
+    if (tally(all).passed) return 'progress';
+    return 'none';
+  };
+  const STATE_LABEL = {done: 'Done', failing: 'Failing', progress: 'In progress', none: 'Not started', empty: 'No criteria yet'};
+  const FSTATUS = {passed: ['Passed', 'is-passed'], failed: ['Failed', 'is-failed'], progress: ['In progress', 'is-progress'], none: ['Not started', ''], nocrit: ['No criteria', '']};
+
+  // ---- Filtering ---------------------------------------------------------
+  const view = () => {
+    const q = F.q.trim().toLowerCase();
+    const hit = (s) => s.toLowerCase().includes(q);
+    const critOk = (c) => (!F.verify || c.verify === F.verify) && (!F.status || statusOf(c.id) === F.status);
+    const feats = features.filter((f) => {
+      if (F.milestone && f.milestone !== F.milestone) return false;
+      if (F.area && f.area !== F.area) return false;
+      if (F.priority && f.priority !== F.priority) return false;
+      const cs = critByFeature.get(f.id) || [];
+      if ((F.verify || F.status) && !cs.some(critOk)) return false;
+      if (q && !hit(f.id + ' ' + f.title) && !cs.some((c) => hit(c.id + ' ' + c.text))) return false;
+      return true;
+    });
+    const kept = new Set(feats.map((f) => f.id));
+    const titleHit = new Set(feats.filter((f) => q && hit(f.id + ' ' + f.title)).map((f) => f.id));
+    const pick = F.feature && kept.has(F.feature) ? F.feature : '';
+    const crits = criteria.filter((c) => kept.has(c.feature) && critOk(c) && (!pick || c.feature === pick)
+      && (!q || titleHit.has(c.feature) || hit(c.id + ' ' + c.text)));
+    return {feats, crits, pick};
+  };
+
+  // ---- Rendering ---------------------------------------------------------
+  const bar = (t, small) => {
+    const b = el('div', 'bar' + (small ? ' is-small' : ''));
+    b.setAttribute('role', 'img');
+    b.setAttribute('aria-label', `${t.passed} passed, ${t.failed} failed, ${t.none} not started`);
+    const w = (n) => (t.total ? (n / t.total) * 100 : 0) + '%';
+    const ok = el('span', 'b-ok'); ok.style.width = w(t.passed);
+    const bad = el('span', 'b-bad'); bad.style.width = w(t.failed);
+    b.append(ok, bad);
+    return b;
+  };
+
+  const renderSummary = () => {
+    const t = tally(criteria);
+    const must = features.filter((f) => f.priority === 'Must').length;
+    const msWithCrit = MILESTONES.filter(([m]) => milestoneState(m) !== 'empty');
+    const done = msWithCrit.filter(([m]) => milestoneState(m) === 'done').length;
+    $('t-features').textContent = fmt.format(features.length);
+    $('t-features-sub').textContent = `${fmt.format(must)} Must`;
+    $('t-criteria').textContent = fmt.format(t.total);
+    $('t-criteria-sub').textContent = `${fmt.format(t.none)} not started`;
+    $('t-passed').textContent = fmt.format(t.passed);
+    $('t-passed-sub').textContent = t.total ? pct.format(t.passed / t.total) + ' of all criteria' : '';
+    $('t-failed').textContent = fmt.format(t.failed);
+    $('t-failed-sub').textContent = t.failed ? 'Needs attention' : 'None failing';
+    $('t-ms').textContent = `${done} / ${msWithCrit.length}`;
+    $('t-ms-sub').textContent = 'With criteria assigned';
+
+    const next = MILESTONES.find(([m]) => ['none', 'progress', 'failing'].includes(milestoneState(m)));
+    const lede = $('lede');
+    lede.replaceChildren();
+    const b = (s) => el('b', null, s);
+    lede.append(b(fmt.format(features.length)), ' features with ', b(fmt.format(t.total)), ' acceptance criteria across nine milestones. ',
+      b(fmt.format(t.passed)), ' passed and ', b(fmt.format(t.failed)), ' failed so far.');
+    if (next) lede.append(' Next milestone to finish: ', b(`${next[0]} ${next[1]}`), '.');
+    if (milestoneState('M7') === 'empty') lede.append(' M7 has no criteria yet because the hook plugin spec is a placeholder.');
+  };
+
+  const renderLadder = () => {
+    const box = $('ladder');
+    box.replaceChildren(...MILESTONES.map(([m, name]) => {
+      const fs = features.filter((f) => f.milestone === m);
+      const cs = criteria.filter((c) => featById.get(c.feature).milestone === m);
+      const must = cs.filter((c) => featById.get(c.feature).priority === 'Must');
+      const tm = tally(must);
+      const st = milestoneState(m);
+      const row = el('button', 'rung' + (F.milestone === m ? ' is-picked' : ''));
+      row.type = 'button';
+      row.dataset.m = m;
+      row.setAttribute('aria-pressed', F.milestone === m ? 'true' : 'false');
+      const chip = el('span', 'chip ' + {done: 'is-done', failing: 'is-failing', progress: 'is-progress', empty: 'is-empty'}[st], STATE_LABEL[st]);
+      row.append(el('span', 'rung-id', m), el('span', 'rung-name', name), bar(tally(cs)), chip,
+        el('span', 'rung-meta', cs.length
+          ? `${fmt.format(fs.length)} features · ${fmt.format(tm.passed)} of ${fmt.format(tm.total)} Must criteria passed · ${fmt.format(cs.length)} criteria in all`
+          : 'No features or criteria assigned yet'));
+      return row;
+    }));
+  };
+
+  const renderAreas = () => {
+    const tb = $('areas');
+    tb.replaceChildren(...SPEC.areas.map((a) => {
+      const fs = features.filter((f) => f.area === a.area);
+      const cs = criteria.filter((c) => c.area === a.area);
+      const tr = el('tr', 'clickable' + (F.area === a.area ? ' is-picked' : ''));
+      tr.dataset.area = a.area;
+      tr.tabIndex = 0;
+      const prog = el('td');
+      if (a.placeholder) prog.append(el('span', 'muted', 'Spec not written yet'));
+      else { const wrap = el('div'); wrap.style.cssText = 'display:flex;align-items:center;gap:8px'; const t = tally(cs); wrap.append(bar(t, true), el('span', 'num muted', `${t.passed}/${t.total}`)); prog.append(wrap); }
+      tr.append(el('td', 'id', a.area), el('td', null, a.name), el('td', 'r num', fmt.format(fs.length)), el('td', 'r num', fmt.format(cs.length)), prog);
+      return tr;
+    }));
+  };
+
+  const renderChecks = () => {
+    const counts = new Map();
+    criteria.forEach((c) => counts.set(c.verify, (counts.get(c.verify) || 0) + 1));
+    const keys = [...counts.keys()].sort((a, b) => (VERIFY_ORDER.indexOf(a) + 99) % 99 - (VERIFY_ORDER.indexOf(b) + 99) % 99 || a.localeCompare(b));
+    const max = Math.max(1, ...counts.values());
+    $('checks').replaceChildren(...keys.map((k) => {
+      const list = criteria.filter((c) => c.verify === k);
+      const t = tally(list);
+      const row = el('button', 'check-row' + (F.verify === k ? ' is-picked' : ''));
+      row.type = 'button';
+      row.dataset.verify = k;
+      row.setAttribute('aria-pressed', F.verify === k ? 'true' : 'false');
+      const track = el('div');
+      track.style.width = (list.length / max) * 100 + '%';
+      track.append(bar(t));
+      row.append(el('span', 'mono', k), track, el('span', 'num', fmt.format(list.length)));
+      return row;
+    }));
+  };
+
+  const fillSelects = () => {
+    const fill = (sel, all, opts) => {
+      sel.replaceChildren(new Option(all, ''), ...opts.map(([v, l]) => new Option(l, v)));
+    };
+    fill($('f-milestone'), 'All milestones', MILESTONES.map(([m, n]) => [m, `${m} ${n}`]));
+    fill($('f-area'), 'All areas', SPEC.areas.map((a) => [a.area, `${a.area} · ${a.name}`]));
+    const verifies = [...new Set(criteria.map((c) => c.verify))].sort((a, b) => (VERIFY_ORDER.indexOf(a) + 99) % 99 - (VERIFY_ORDER.indexOf(b) + 99) % 99);
+    fill($('f-verify'), 'All checks', verifies.map((v) => [v, v]));
+  };
+
+  const syncFilters = () => {
+    ['milestone', 'area', 'priority', 'verify', 'status'].forEach((k) => {
+      const sel = $('f-' + k);
+      if (sel !== document.activeElement) sel.value = F[k];
+    });
+    const q = $('f-q');
+    if (q !== document.activeElement) q.value = F.q;
+  };
+
+  const renderFeatures = (v) => {
+    $('features').replaceChildren(...v.feats.map((f) => {
+      const tr = el('tr', 'clickable' + (f.id === v.pick ? ' is-picked' : ''));
+      tr.dataset.feature = f.id;
+      tr.tabIndex = 0;
+      tr.setAttribute('aria-selected', f.id === v.pick ? 'true' : 'false');
+      const t = tally(critByFeature.get(f.id) || []);
+      const [label, cls] = FSTATUS[featureStatus(f)];
+      const title = el('td', null, f.title);
+      const pr = el('td'); pr.append(el('span', 'pill' + (f.priority === 'Must' ? ' is-must' : ''), f.priority));
+      const st = el('td'); st.append(el('span', 'pill ' + cls, label));
+      tr.append(el('td', 'id', f.id), title, pr, el('td', 'mono', f.milestone), el('td', 'r num', `${t.passed}/${t.total}`), st);
+      return tr;
+    }));
+    $('features-empty').hidden = v.feats.length > 0;
+  };
+
+  const writable = () => S.dbState === 'ok' && S.canWrite !== false;
+
+  const renderCriteria = (v) => {
+    const canW = writable();
+    const ids = new Set();
+    $('criteria').replaceChildren(...v.crits.map((c) => {
+      const s = S.statuses.get(c.id);
+      const cur = s ? s.status : 'none';
+      const tr = el('tr');
+      tr.dataset.crit = c.id;
+      const text = el('td', 'crit-text');
+      text.append(el('div', null, c.text));
+      if (s) {
+        const meta = el('div', 'crit-meta');
+        const who = el('span');
+        who.append(cur === 'passed' ? 'Passed' : 'Failed');
+        if (s.by) { ids.add(s.by); who.append(' by '); const n = el('span', 'who'); n.dataset.uid = s.by; n.textContent = S.names[s.by] || 'someone'; who.append(n); }
+        if (s.at && !isNaN(Date.parse(s.at))) who.append(' on ' + dateFmt.format(new Date(s.at)));
+        meta.append(who);
+        if (canW) {
+          const note = el('input', 'crit-note');
+          note.type = 'text';
+          note.maxLength = 500;
+          note.placeholder = cur === 'failed' ? 'What failed? (optional)' : 'Note (optional)';
+          note.value = s.note || '';
+          note.dataset.crit = c.id;
+          note.id = 'note-' + c.id;
+          note.setAttribute('aria-label', 'Note for ' + c.id);
+          meta.append(note);
+        } else if (s.note) {
+          meta.append(el('span', 'crit-note-ro', s.note));
+        }
+        text.append(meta);
+      }
+      const seg = el('div', 'seg' + (S.pending.has(c.id) ? ' is-pending' : ''));
+      seg.setAttribute('role', 'radiogroup');
+      seg.setAttribute('aria-label', 'Status of ' + c.id);
+      [['none', 'Not started'], ['passed', 'Passed'], ['failed', 'Failed']].forEach(([val, label]) => {
+        const b = el('button', null, label);
+        b.type = 'button';
+        b.dataset.set = val;
+        b.setAttribute('role', 'radio');
+        b.setAttribute('aria-checked', cur === val ? 'true' : 'false');
+        b.disabled = !canW || S.pending.has(c.id);
+        seg.append(b);
+      });
+      const stTd = el('td'); stTd.append(seg);
+      tr.append(el('td', 'id', c.id), text, el('td', 'mono muted', c.verify), stTd);
+      return tr;
+    }));
+    $('criteria-empty').hidden = v.crits.length > 0;
+    const pick = v.pick ? featById.get(v.pick) : null;
+    $('crit-title').textContent = pick ? `Acceptance criteria of ${pick.id}` : 'Acceptance criteria';
+    $('crit-note').textContent = pick ? pick.title : 'For the features in the list. Set each criterion to Passed or Failed when it has been checked.';
+    resolveNames([...ids]);
+  };
+
+  const resolveNames = async (ids) => {
+    if (!S.user || !ids.length) return;
+    let ps;
+    try { ps = await S.user.profiles(ids); } catch { return; }
+    ids.forEach((id) => { if (ps[id]) S.names[id] = ps[id].isMe ? 'you' : (ps[id].name || 'someone'); });
+    document.querySelectorAll('.who[data-uid]').forEach((n) => { n.textContent = S.names[n.dataset.uid] || 'someone'; });
+  };
+
+  const renderBanner = () => {
+    const bn = $('banner');
+    let msg = '', bad = false;
+    if (S.dbState === 'loading') msg = 'Loading statuses…';
+    else if (S.dbState === 'unavailable') msg = 'Statuses can’t be loaded in this view, so every criterion shows as Not started. Open the page on claude.ai while signed in to see and change them.';
+    else if (S.dbState === 'error') { msg = 'The connection to the status store stopped. Reload the page to see the latest statuses.'; bad = true; }
+    else if (S.canWrite === false) msg = 'You can view statuses but not change them. Ask the owner for Contributor access to mark criteria Passed or Failed.';
+    if (S.writeError) { msg = S.writeError; bad = true; }
+    bn.hidden = !msg;
+    bn.className = 'banner' + (bad ? ' is-bad' : '');
+    bn.textContent = msg;
+  };
+
+  const renderFilterBar = (v) => {
+    const fb = $('f-feature');
+    fb.hidden = !v.pick;
+    fb.textContent = v.pick ? v.pick + ' ×' : '';
+    fb.setAttribute('aria-label', v.pick ? `Stop showing only ${v.pick}` : '');
+    $('shown').textContent = `${fmt.format(v.feats.length)} of ${fmt.format(features.length)} features · ${fmt.format(v.crits.length)} criteria`;
+  };
+
+  let queued = false;
+  const render = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      const active = document.activeElement;
+      const focusKey = active && active.id && active.id.startsWith('note-') ? active.id : null;
+      const caret = focusKey ? [active.selectionStart, active.selectionEnd, active.value] : null;
+      const v = view();
+      renderBanner(); renderSummary(); renderLadder(); renderAreas(); renderChecks();
+      syncFilters(); renderFilterBar(v); renderFeatures(v); renderCriteria(v);
+      if (focusKey) {
+        const again = $(focusKey);
+        if (again) { again.value = caret[2]; again.focus(); try { again.setSelectionRange(caret[0], caret[1]); } catch {} }
+      }
+    });
+  };
+
+  // ---- Writes ------------------------------------------------------------
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const withRetry = async (fn) => {
+    try { return await fn(); }
+    catch (e) {
+      if (e && e.code === 'unavailable') { await sleep(400 + Math.random() * 600); return fn(); }
+      throw e;
+    }
+  };
+  const onWriteError = (e) => {
+    const code = e && e.code;
+    if (code === 'invalid_argument') { S.canWrite = false; S.writeError = ''; }
+    else if (code === 'quota_exceeded') S.writeError = 'The status store is full, so the change wasn’t saved. Ask the owner to clear old statuses.';
+    else if (code === 'resource_exhausted') S.writeError = 'Too many changes in a short time. Wait a moment, then try again.';
+    else if (code === 'revoked' || code === 'not_granted') { S.dbState = 'unavailable'; S.writeError = ''; }
+    else S.writeError = 'The change wasn’t saved. Check your connection and try again.';
+  };
+
+  const setStatus = async (id, value) => {
+    if (!writable() || S.pending.has(id)) return;
+    const cur = S.statuses.get(id);
+    if ((cur ? cur.status : 'none') === value) return;
+    S.pending.add(id);
+    S.writeError = '';
+    render();
+    const ref = S.db.doc('status/' + id);
+    try {
+      if (value === 'none') await withRetry(() => ref.delete());
+      else await withRetry(() => ref.set({status: value, by: S.uid, at: new Date().toISOString(), note: cur ? cur.note || '' : ''}));
+    } catch (e) { onWriteError(e); }
+    finally { S.pending.delete(id); render(); }
+  };
+
+  const saveNote = async (id, value) => {
+    const cur = S.statuses.get(id);
+    if (!cur || !writable() || S.pending.has(id)) return;
+    const note = value.trim().slice(0, 500);
+    if (note === (cur.note || '')) return;
+    S.pending.add(id);
+    S.writeError = '';
+    try { await withRetry(() => S.db.doc('status/' + id).update({note})); }
+    catch (e) { onWriteError(e); }
+    finally { S.pending.delete(id); render(); }
+  };
+
+  // ---- Events ------------------------------------------------------------
+  const setFilter = (patch) => { Object.assign(F, patch); render(); };
+  let qTimer = null;
+  $('f-q').addEventListener('input', (e) => { clearTimeout(qTimer); qTimer = setTimeout(() => setFilter({q: e.target.value, feature: ''}), 180); });
+  ['milestone', 'area', 'priority', 'verify', 'status'].forEach((k) => {
+    $('f-' + k).addEventListener('change', (e) => setFilter({[k]: e.target.value, feature: ''}));
+  });
+  $('f-clear').addEventListener('click', () => { $('f-q').value = ''; setFilter({q: '', milestone: '', area: '', priority: '', verify: '', status: '', feature: ''}); });
+  $('f-feature').addEventListener('click', () => setFilter({feature: ''}));
+
+  $('ladder').addEventListener('click', (e) => {
+    const r = e.target.closest('.rung'); if (!r) return;
+    setFilter({milestone: F.milestone === r.dataset.m ? '' : r.dataset.m, feature: ''});
+  });
+  $('checks').addEventListener('click', (e) => {
+    const r = e.target.closest('.check-row'); if (!r) return;
+    setFilter({verify: F.verify === r.dataset.verify ? '' : r.dataset.verify, feature: ''});
+  });
+  const rowAct = (tbodyId, attr, apply) => {
+    const tb = $(tbodyId);
+    const go = (e) => { const tr = e.target.closest('tr[data-' + attr + ']'); if (tr) apply(tr.dataset[attr]); };
+    tb.addEventListener('click', go);
+    tb.addEventListener('keydown', (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('tr')) { e.preventDefault(); go(e); } });
+  };
+  rowAct('areas', 'area', (a) => setFilter({area: F.area === a ? '' : a, feature: ''}));
+  rowAct('features', 'feature', (id) => setFilter({feature: F.feature === id ? '' : id}));
+
+  $('criteria').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-set]'); if (!b || b.disabled) return;
+    const tr = b.closest('tr[data-crit]');
+    setStatus(tr.dataset.crit, b.dataset.set);
+  });
+  $('criteria').addEventListener('keydown', (e) => {
+    if (e.target.matches('.crit-note') && e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+  });
+  $('criteria').addEventListener('change', (e) => {
+    if (e.target.matches('.crit-note')) saveNote(e.target.dataset.crit, e.target.value);
+  });
+
+  // ---- Start -------------------------------------------------------------
+  $('about-source').textContent = `The spec files in docs/specs of the repository, read on ${SPEC.generated}: ${SPEC.areas.length} spec files.`;
+  fillSelects();
+  render();
+
+  const use = (name) => (window.claude && typeof window.claude.use === 'function' ? window.claude.use(name) : Promise.resolve(null));
+  (async () => {
+    const [db, user] = await Promise.all([use('db').catch(() => null), use('user').catch(() => null)]);
+    S.user = user;
+    if (user) {
+      try { S.uid = await user.id(); } catch { S.uid = null; }
+      try { S.canWrite = await user.can('data.write'); } catch { S.canWrite = null; }
+    }
+    if (!db) { S.dbState = 'unavailable'; render(); return; }
+    S.db = db;
+    db.collection('status').limit(1000).onSnapshot((snap) => {
+      const next = new Map();
+      snap.docs.forEach((d) => { const v = clean(d.data()); if (v) next.set(d.id, v); });
+      S.statuses = next;
+      if (S.dbState !== 'error') S.dbState = 'ok';
+      render();
+    }, () => { S.dbState = 'error'; render(); });
+  })();
+})();
+</script>

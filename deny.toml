@@ -1,0 +1,101 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/).
+# Written for cargo-deny 0.20.x. Run locally with:  cargo deny check
+# CI: .github/workflows/ci.yml (job `cargo-deny`) and scheduled.yml.
+
+[graph]
+# Only evaluate dependencies that can actually end up in our binaries. This
+# hides e.g. unix/wasm-only transitive crates from the license/ban checks.
+# Keep in sync with the CI build matrix. Linux is listed for the optional
+# portable-crate job (`test-linux`); remove it if that job is never used.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# --------------------------------------------------------------------------
+[advisories]
+# RustSec advisory DB (default db-urls). Every advisory kind (vulnerability,
+# unsound, notice) is an error unless listed in `ignore` with a reason.
+# Unmaintained crates only fail when they are *direct* dependencies of the
+# workspace; transitive ones are something we cannot fix ourselves.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    #{ id = "RUSTSEC-0000-0000", reason = "why it does not affect us" },
+]
+
+# --------------------------------------------------------------------------
+[licenses]
+# DECIDED (owner, see docs/product-direction.md D3/D13): the rewrite is a
+# clean reimplementation licensed "MIT OR Apache-2.0". Everything linked into
+# the shipped binaries must therefore be permissive, so the binaries can be
+# redistributed under MIT/Apache-2.0 terms.
+#
+#   * Copyleft crates (GPL, LGPL, AGPL) are NOT allowed: Rust links them
+#     statically, which would put the whole binary under their terms.
+#   * MPL-2.0 is allowed: its copyleft is per file and does not spread to our
+#     code (we must still publish changes to MPL files we modify).
+# Only add a license after checking it is permissive.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unlicense",
+    "CC0-1.0",
+    # Unicode data tables (e.g. unicode-ident).
+    "Unicode-3.0",
+    # Mozilla Public License 2.0: weak, file-level copyleft (see above).
+    "MPL-2.0",
+]
+# Keep the allow-list as a policy, even if not every license is in use yet.
+unused-allowed-license = "allow"
+confidence-threshold = 0.93
+exceptions = [
+    # Per-crate escape hatch, e.g.:
+    #{ crate = "some-crate", allow = ["OFL-1.1"] },
+]
+
+# Our own workspace crates are checked too (they must declare a license:
+# `license = "MIT OR Apache-2.0"` in [workspace.package]).
+[licenses.private]
+ignore = false
+
+# --------------------------------------------------------------------------
+[bans]
+# The windows / windows-sys family routinely appears in several versions, so
+# duplicates are a warning, not an error. Tighten later if desired.
+multiple-versions = "warn"
+# `*` version requirements are never acceptable for registry dependencies...
+wildcards = "deny"
+# ...but path/git dependencies between unpublished workspace crates are fine.
+# (Mark internal crates `publish = false` for this to apply.)
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # Example: keep OpenSSL out of a Windows app (use rustls / SChannel).
+    #{ crate = "openssl-sys", reason = "use rustls or native Windows TLS" },
+]
+skip = []
+skip-tree = []
+
+# --------------------------------------------------------------------------
+[sources]
+# Only crates.io. Any git dependency must be listed explicitly.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
