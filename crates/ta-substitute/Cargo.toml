@@ -1,0 +1,16 @@
+[package]
+name = "ta-substitute"
+description = "Substitution profiles, the longest-match engine and UserDict.txt import and export."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-core.workspace = true
+ta-text.workspace = true
+
+[lints]
+workspace = true

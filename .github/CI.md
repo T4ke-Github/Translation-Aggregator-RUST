@@ -17,6 +17,7 @@ needed.
 | `docs` | Windows | `cargo doc --no-deps --document-private-items` with `RUSTDOCFLAGS=-D warnings` |
 | `msrv` | Windows | `cargo +<MSRV> check --workspace` |
 | `cargo-deny` | Linux | `bans licenses sources` (blocking) and `advisories` (warning only) using `deny.toml` |
+| `legacy-files` | Linux | Runs always. Fails if a tracked file is a copy of a legacy file (`tools/legacy-check/`, D13) |
 | `ci-result` | Linux | One aggregate status. Make this the only required check in branch protection |
 
 Notes:
@@ -70,6 +71,7 @@ cargo test --workspace --doc --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --all-features --locked
 cargo +1.90 check --workspace --all-features --locked   # replace 1.90 with your MSRV
 cargo deny --all-features check
+python -I tools/legacy-check/check_legacy_files.py
 ```
 
 PowerShell: set the doc flags with `$env:RUSTDOCFLAGS = "-D warnings"` first.
