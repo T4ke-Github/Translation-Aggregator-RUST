@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# MSRV (D2, NFR-01.2). Raising it needs a new decision in docs/product-direction.md.
+rust-version = "1.90"
+# The project license (D3, NFR-09.1). Every crate inherits it.
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/T4ke-Github/Translation-Aggregator-RUST"
+# Nothing is published to crates.io. Also lets cargo-deny accept path dependencies.
+publish = false
+
+[workspace.dependencies]
+# Internal crates. Third-party dependencies are added here too, so every crate
+# uses the same version; check new ones against deny.toml first.
+ta-text = { path = "crates/ta-text" }
+ta-core = { path = "crates/ta-core" }
+ta-substitute = { path = "crates/ta-substitute" }
+ta-dict = { path = "crates/ta-dict" }
+ta-morph = { path = "crates/ta-morph" }
+ta-translate = { path = "crates/ta-translate" }
+ta-provider-web = { path = "crates/ta-provider-web" }
+ta-provider-llm = { path = "crates/ta-provider-llm" }
+ta-plugin-protocol = { path = "crates/ta-plugin-protocol" }
+ta-platform = { path = "crates/ta-platform" }
+ta-ingest = { path = "crates/ta-ingest" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

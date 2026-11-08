@@ -1,0 +1,26 @@
+[package]
+name = "ta-gui"
+description = "The Translation Aggregator desktop app."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "translation-aggregator"
+path = "src/main.rs"
+
+[dependencies]
+ta-ingest.workspace = true
+ta-substitute.workspace = true
+ta-dict.workspace = true
+ta-morph.workspace = true
+ta-provider-web.workspace = true
+ta-provider-llm.workspace = true
+ta-plugin-protocol.workspace = true
+ta-platform.workspace = true
+
+[lints]
+workspace = true

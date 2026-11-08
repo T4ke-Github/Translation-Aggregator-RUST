@@ -349,8 +349,9 @@ that I can set it up and build on it without reading the code.
 
 ### NFR-12 Testing strategy
 
-**Priority:** Must · **Milestone:** M0 · **Decisions:** D4, D13, D20 · **Legacy:** `migration-plan.md`
-"Test summary" · **Depends on:** NFR-02
+**Priority:** Must · **Milestone:** M0 (NFR-12.2 and NFR-12.3: M1, when the first preset and the
+first kept features exist; NFR-12.4: M6, when the last part it covers exists) · **Decisions:** D4,
+D13, D20 · **Legacy:** `migration-plan.md` "Test summary" · **Depends on:** NFR-02
 
 As the owner, I want each kind of behaviour tested with the right method, so that parity, contracts
 and security are checked without depending on live services.
