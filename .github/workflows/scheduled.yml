@@ -1,0 +1,99 @@
+# Weekly early-warning checks that do not depend on a code change:
+#   * new RustSec advisories against the committed Cargo.lock (blocking here,
+#     non-blocking in ci.yml)
+#   * the upcoming Rust release (beta) still builds and passes tests
+#
+# Skipped automatically while no root Cargo.toml exists. See .github/CI.md.
+
+name: Scheduled
+
+on:
+  schedule:
+    # Mondays 05:23 UTC (off the full hour to avoid GitHub's cron rush).
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  detect:
+    name: Detect Cargo workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cargo: ${{ steps.detect.outputs.cargo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: /Cargo.toml
+          sparse-checkout-cone-mode: false
+      - id: detect
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Scheduled checks skipped::No Cargo.toml at the repository root yet."
+          fi
+
+  advisories:
+    name: cargo-deny advisories
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny
+          fallback: none
+      - run: cargo deny --all-features check advisories
+
+  beta:
+    name: Beta toolchain (${{ matrix.target }})
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: beta
+          targets: ${{ matrix.target }}
+      # No cache: runs once a week on a toolchain whose artifacts would never
+      # be reused by the regular CI jobs.
+      # Plain `cargo test` (not nextest) keeps this job dependency-free and
+      # also covers doctests (hence no --all-targets, which would skip them).
+      # Clippy is deliberately not run on beta: new lints would be noise until
+      # they reach stable.
+      - run: cargo +beta test --workspace --locked --target ${{ matrix.target }}

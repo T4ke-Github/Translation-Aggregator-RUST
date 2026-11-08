@@ -1,0 +1,298 @@
+# Main CI for the Translation Aggregator Rust rewrite.
+#
+# See .github/CI.md for what each job does and how to run the same checks
+# locally.
+#
+# Until a root Cargo.toml exists, the `detect` job reports "no Cargo
+# workspace" and every Rust job is *skipped* (grey, not red). Nothing needs to
+# be changed here when the workspace is added.
+#
+# Third-party actions are pinned to full commit SHAs; the trailing comment is
+# the release the SHA belongs to. Dependabot (.github/dependabot.yml) bumps
+# both. dtolnay/rust-toolchain has no releases, so it is pinned to a commit of
+# its `master` branch and the toolchain is selected with the `toolchain:`
+# input.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: every job only needs to read the repository.
+permissions:
+  contents: read
+
+# Cancel superseded runs of the same PR / branch. Pushes to `main` are not
+# cancelled, so every commit on main gets a full result (and saves caches).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation only costs cache space in CI.
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+  # MSRV used when Cargo.toml has no `rust-version`. The real source of truth
+  # is `rust-version = "..."` in the root Cargo.toml ([workspace.package] or
+  # [package]); the `detect` job reads it from there. DECIDED (owner): MSRV is
+  # 1.90 - set `rust-version = "1.90"` in Cargo.toml when it is created.
+  MSRV_FALLBACK: "1.90"
+
+defaults:
+  run:
+    # Same shell on Windows and Linux runners (Git Bash on Windows).
+    shell: bash
+
+jobs:
+  detect:
+    name: Detect Cargo workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cargo: ${{ steps.detect.outputs.cargo }}
+      msrv: ${{ steps.detect.outputs.msrv }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: /Cargo.toml
+          sparse-checkout-cone-mode: false
+      - id: detect
+        name: Look for Cargo.toml and rust-version
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "cargo=true" >> "$GITHUB_OUTPUT"
+            msrv=$(sed -nE 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          else
+            echo "cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Rust CI skipped::No Cargo.toml at the repository root yet; all Rust jobs are skipped."
+          fi
+          msrv="${msrv:-$MSRV_FALLBACK}"
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $msrv"
+
+  fmt:
+    name: Rustfmt
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    # Formatting is platform independent, so use the cheapest/fastest runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.target }})
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # DECIDED (owner): the whole app ships as 32-bit and 64-bit builds,
+        # so lint both: cfg(target_pointer_width) code differs.
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          # PRs restore caches written by main but never write their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --all-features: drop it if the workspace ever gets mutually exclusive
+      # features (then use cargo-hack --feature-powerset instead).
+      - run: cargo clippy --workspace --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
+
+  test:
+    name: Build + test (${{ matrix.target }})
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # i686 binaries run natively on the x64 runner (WoW64), so tests run
+        # for both targets. Both are required: the app ships 32-bit and 64-bit.
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The tool version (cargo-nextest 0.9.151) is pinned by the action SHA.
+      # fallback: none => never fall back to cargo-binstall / building from source.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+          fallback: none
+      - name: Build
+        run: cargo build --workspace --all-targets --locked --target ${{ matrix.target }}
+      - name: Test (nextest)
+        # --no-tests=warn: an early workspace without tests must not fail CI.
+        run: cargo nextest run --workspace --locked --target ${{ matrix.target }} --no-fail-fast --no-tests=warn
+      - name: Doctests
+        # nextest does not run doctests. `cargo test --doc` errors out when the
+        # workspace has no library target (only bins / cdylibs), so skip then.
+        run: |
+          if cargo metadata --no-deps --format-version 1 --locked \
+              | jq -e '[.packages[].targets[].kind[]] | any(. == "lib" or . == "rlib" or . == "proc-macro")' > /dev/null; then
+            cargo test --workspace --doc --locked --target ${{ matrix.target }}
+          else
+            echo "::notice title=Doctests skipped::No library targets in the workspace."
+          fi
+
+  # Optional Linux job for platform-independent crates (text processing,
+  # translation-service clients, config, ...). Off by default because the app
+  # is Windows-first and most crates will not build on Linux.
+  #
+  # Enable: Settings -> Secrets and variables -> Actions -> Variables:
+  #   CI_ENABLE_LINUX   = true
+  #   CI_LINUX_PACKAGES = -p crate-a -p crate-b   (default: --workspace, which
+  #                       only works if Windows-only crates are `#![cfg(windows)]`)
+  # Worth it once there are portable crates: a Linux runner is faster and
+  # cheaper than Windows and catches accidental Windows-only assumptions.
+  test-linux:
+    name: Test (Linux, portable crates)
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true' && vars.CI_ENABLE_LINUX == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PACKAGES: ${{ vars.CI_LINUX_PACKAGES || '--workspace' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+          fallback: none
+      - name: Clippy + test
+        run: |
+          read -ra pkgs <<< "$PACKAGES"   # split "-p a -p b" into separate args
+          cargo clippy "${pkgs[@]}" --all-targets --all-features --locked -- -D warnings
+          cargo nextest run "${pkgs[@]}" --locked --no-fail-fast --no-tests=warn
+
+  docs:
+    name: Docs
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Private items are documented too: this is an application, not a
+      # published library, so internal docs are the docs that matter.
+      - run: cargo doc --workspace --no-deps --document-private-items --all-features --locked
+
+  msrv:
+    name: MSRV (${{ needs.detect.outputs.msrv }})
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: ${{ needs.detect.outputs.msrv }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `cargo +<ver>` wins over a rust-toolchain.toml, should one be added.
+      # No --all-targets: dev-dependencies may legitimately need a newer Rust.
+      - run: cargo +${{ needs.detect.outputs.msrv }} check --workspace --all-features --locked
+
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [advisories, bans licenses sources]
+    # A newly published advisory must not turn unrelated PRs red; it is
+    # reported here as a warning and fails the weekly scheduled workflow
+    # instead. Licenses/bans/sources only change with our own changes, so they
+    # always block.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: stable
+      # Installs cargo-deny 0.20.2 (pinned by the action SHA).
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny
+          fallback: none
+      # Configuration: deny.toml at the repository root.
+      - run: cargo deny --all-features check ${{ matrix.checks }}
+
+  # Single required status check for branch protection: mark only "CI result"
+  # as required instead of every matrix leg. Skipped jobs count as success.
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [detect, fmt, clippy, test, test-linux, docs, msrv, cargo-deny]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any job failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "One or more CI jobs failed or were cancelled."
+          exit 1
+      - run: echo "All CI jobs passed or were skipped."

@@ -1,0 +1,43 @@
+# Dependabot version updates. Security updates are enabled separately in
+# Settings -> Code security (they ignore the schedule and the cooldown below).
+#
+# Until a root Cargo.toml exists, the cargo entry finds nothing to update
+# (Dependabot may log "dependency file not found"; this does not affect CI).
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Dependency cooldown: wait before proposing a freshly published release,
+    # so yanked or compromised versions are usually caught before we pull them.
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      # One PR for all semver-compatible bumps; majors get their own PRs.
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    # "/" covers .github/workflows. Dependabot updates both the pinned SHA and
+    # the "# vX.Y.Z" comment. Note: dtolnay/rust-toolchain is pinned to a
+    # master-branch commit (it has no releases), so bump that one by hand.
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
