@@ -113,6 +113,82 @@ pub enum RequestRejection {
     },
 }
 
+/// Whether a request was initiated automatically or explicitly by the user.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestMode {
+    /// A request initiated by automatic translation.
+    Automatic,
+    /// An explicit request for one translator.
+    Manual,
+    /// An explicit request to use every eligible translator.
+    TranslateAll,
+}
+
+/// Why a translator was excluded by routing policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingRejection {
+    /// The translator is switched off.
+    ProviderDisabled,
+    /// Remote sending has not been permitted.
+    RemotePermissionRequired,
+    /// A remote credential is unavailable.
+    MissingCredentials,
+    /// The request violates a provider capability.
+    Provider(RequestRejection),
+    /// Automatic translation is switched off for the translator.
+    AutoTranslateDisabled,
+}
+
+/// Inputs needed to decide if one translator can receive this request.
+pub struct RoutingRequest<'a> {
+    /// Translator capability metadata.
+    pub capabilities: &'a TranslatorCapabilities,
+    /// Whether this translator is switched on.
+    pub provider_enabled: bool,
+    /// Whether required credentials are available.
+    pub credentials_available: bool,
+    /// Whether sending text off-device is allowed.
+    pub remote_permission: bool,
+    /// Whether automatic translation is switched on.
+    pub auto_translate_enabled: bool,
+    /// Requested source language.
+    pub source: &'a str,
+    /// Requested target language.
+    pub target: &'a str,
+    /// Text to translate.
+    pub text: &'a str,
+    /// How the request was started.
+    pub mode: RequestMode,
+}
+
+/// Check routing switches independently from provider capabilities.
+pub fn routing_request_rejection(request: RoutingRequest<'_>) -> Option<RoutingRejection> {
+    let RoutingRequest {
+        capabilities,
+        provider_enabled,
+        credentials_available,
+        remote_permission,
+        auto_translate_enabled,
+        source,
+        target,
+        text,
+        mode,
+    } = request;
+    if !provider_enabled {
+        return Some(RoutingRejection::ProviderDisabled);
+    }
+    if capabilities.remote && !remote_permission {
+        return Some(RoutingRejection::RemotePermissionRequired);
+    }
+    if capabilities.remote && !credentials_available {
+        return Some(RoutingRejection::MissingCredentials);
+    }
+    if mode == RequestMode::Automatic && !auto_translate_enabled {
+        return Some(RoutingRejection::AutoTranslateDisabled);
+    }
+    request_rejection(capabilities, source, target, text).map(RoutingRejection::Provider)
+}
+
 /// Check provider constraints shared by manual and automatic requests.
 pub fn request_rejection(
     capabilities: &TranslatorCapabilities,
@@ -278,6 +354,108 @@ mod tests {
         assert_eq!(
             auto_request_rejection(&caps, false, "ja", "en", "x", 500),
             Some(AutoRequestRejection::Disabled)
+        );
+    }
+
+    #[test]
+    fn routing_policy_rejects_disabled_provider_and_remote_without_credentials() {
+        let remote = TranslatorCapabilities::new(TranslatorKind::Remote);
+        assert_eq!(
+            routing_request_rejection(RoutingRequest {
+                capabilities: &remote,
+                provider_enabled: true,
+                credentials_available: false,
+                remote_permission: true,
+                auto_translate_enabled: true,
+                source: "ja",
+                target: "en",
+                text: "x",
+                mode: RequestMode::Automatic,
+            }),
+            Some(RoutingRejection::MissingCredentials)
+        );
+        assert_eq!(
+            routing_request_rejection(RoutingRequest {
+                capabilities: &remote,
+                provider_enabled: false,
+                credentials_available: true,
+                remote_permission: true,
+                auto_translate_enabled: true,
+                source: "ja",
+                target: "en",
+                text: "x",
+                mode: RequestMode::Automatic,
+            }),
+            Some(RoutingRejection::ProviderDisabled)
+        );
+    }
+
+    #[test]
+    fn translate_all_overrides_auto_switch_but_not_provider_constraints() {
+        let mut remote = TranslatorCapabilities::new(TranslatorKind::Remote);
+        remote.supported_target_languages = Some(vec!["fr".into()]);
+        assert_eq!(
+            routing_request_rejection(RoutingRequest {
+                capabilities: &remote,
+                provider_enabled: true,
+                credentials_available: true,
+                remote_permission: true,
+                auto_translate_enabled: false,
+                source: "ja",
+                target: "fr",
+                text: "x",
+                mode: RequestMode::TranslateAll,
+            }),
+            None
+        );
+        assert_eq!(
+            routing_request_rejection(RoutingRequest {
+                capabilities: &remote,
+                provider_enabled: true,
+                credentials_available: false,
+                remote_permission: true,
+                auto_translate_enabled: false,
+                source: "ja",
+                target: "fr",
+                text: "x",
+                mode: RequestMode::TranslateAll,
+            }),
+            Some(RoutingRejection::MissingCredentials)
+        );
+        assert_eq!(
+            routing_request_rejection(RoutingRequest {
+                capabilities: &remote,
+                provider_enabled: true,
+                credentials_available: true,
+                remote_permission: true,
+                auto_translate_enabled: false,
+                source: "ja",
+                target: "en",
+                text: "x",
+                mode: RequestMode::TranslateAll,
+            }),
+            Some(RoutingRejection::Provider(
+                RequestRejection::UnsupportedLanguagePair
+            ))
+        );
+    }
+
+    #[test]
+    fn remote_permission_is_separate_from_provider_enabled_state() {
+        let remote = TranslatorCapabilities::new(TranslatorKind::Remote);
+        assert_eq!(
+            routing_request_rejection(RoutingRequest {
+                capabilities: &remote,
+                provider_enabled: true,
+                credentials_available: true,
+                remote_permission: false,
+                auto_translate_enabled: true,
+                source: "ja",
+                target: "en",
+                text: "x",
+                mode: RequestMode::Manual,
+            }),
+            Some(RoutingRejection::RemotePermissionRequired)
         );
     }
 }
