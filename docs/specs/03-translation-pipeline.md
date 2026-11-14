@@ -142,14 +142,13 @@ results side by side.
 **Priority:** Must · **Milestone:** M1 · **Decisions:** D5, D8, D17 · **Legacy:** features.md §1 "Automatic Clipboard Translation" toggle (default on for local panes, off for remote ones) · **Depends on:** PIP-03
 
 As a user, I want remote and paid translators to stay quiet until I turn on automatic translation
-for them, so that I don't send private text or spend money by accident. *(assumes O10
-recommendation)*
+for them, so that I don't send private text or spend money by accident. *(O10 approved)*
 
 **Acceptance criteria**
 
 - **PIP-05.1** Given a newly added translator (web preset, custom service, LLM backend or translator
   plugin), when it is enabled, then its auto-translate is off; built-in local tools (MeCab, JParser)
-  start with it on. *(assumes O10 recommendation)* *(Verify: unit)*
+  start with it on. *(O10 approved)* *(Verify: unit)*
 - **PIP-05.2** Given a translator with remote = yes, when the user turns its auto-translate on, then
   a one-time confirmation names the provider, says the text leaves this machine and may cost money;
   "Cancel" keeps it off. *(Verify: manual)*
@@ -166,7 +165,7 @@ recommendation)*
 **Priority:** Should · **Milestone:** M3 · **Decisions:** D8, D17 · **Legacy:** none (new); risks-and-open-questions.md §2 · **Depends on:** PIP-04
 
 As a user, I want to cap how many requests or characters a provider gets per day or month, so that
-automatic translation can't run up a bill. *(assumes O10 recommendation)*
+automatic translation can't run up a bill. *(O10 approved)*
 
 **Acceptance criteria**
 
@@ -344,10 +343,10 @@ log of a game.
   maximum request length in PIP-03.1 is then the total length it accepts.
 - Offline translation engines in the core: cut (D7); local translators can be plugins (PLG-05).
 
-## 5. Open questions
+## 5. Owner decision
 
-- **O10** (default auto-translate for remote providers): this spec uses the recommendation, off for
-  every added translator with per-provider budgets (PIP-05, PIP-06).
+- **O10** (default auto-translate for remote providers): approved as off for every added translator,
+  with per-provider budgets (PIP-05, PIP-06).
 
 Note for the owner: legacy "post-substitution" means a plugin step after substitutions and before
 translation (PIP-01.1, stage 5). A transform of translated output is not part of v1.
