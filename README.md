@@ -4,10 +4,11 @@ A Rust rewrite of Translation Aggregator for Windows (32-bit and 64-bit). It tra
 arrives through the clipboard or a local API with every translator you configure (official web APIs,
 custom web services, LLMs) and shows the results side by side.
 
-**Status:** planning. There is no code yet.
+**Status:** M0 (scaffolding). The Cargo workspace and CI exist; the crates are still empty.
 
 ## Documentation
 
+- [Contributing](CONTRIBUTING.md): the clean-room rule, building and testing
 - [Product direction](docs/product-direction.md): the decisions (authoritative)
 - [Design specs](docs/specs/README.md): features and acceptance criteria per milestone
 - [Analysis](docs/analysis/README.md): how the legacy app works, and the technical approach

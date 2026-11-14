@@ -1,0 +1,15 @@
+[package]
+name = "ta-platform"
+description = "Thin Win32 wrappers: clipboard listener, hotkeys, credential store, known folders and window transparency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-core.workspace = true
+
+[lints]
+workspace = true

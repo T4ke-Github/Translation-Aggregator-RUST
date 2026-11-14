@@ -1,0 +1,15 @@
+[package]
+name = "ta-core"
+description = "Domain types: languages, contexts and their settings, the input pipeline, history and configuration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-text.workspace = true
+
+[lints]
+workspace = true

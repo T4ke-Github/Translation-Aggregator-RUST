@@ -1,0 +1,15 @@
+[package]
+name = "ta-translate"
+description = "The Translator trait, the router, the result cache, rate limits, retries and cancellation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-core.workspace = true
+
+[lints]
+workspace = true

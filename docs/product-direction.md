@@ -158,7 +158,7 @@ O1–O9 are resolved by D3 and D13–D21. New open questions are added here as t
 
 | # | Question | Recommendation |
 |---|---|---|
-| O10 | Default auto-translate for remote (paid/LLM) providers? | Off (as for remote panes in the old app), with per-provider budgets. |
+| O10 | Default auto-translate for remote (paid/LLM) providers? | Approved: Off (as for remote panes in the old app), with per-provider budgets. |
 | O11 | Bundle a MeCab dictionary and/or EDICT, or download on first use? | Download on first use and show the licence; bundle only with licence and attribution. |
 | O12 | Require the token for the local API output stream even if input stays tokenless? | Yes when the stream is enabled; warn in settings. |
 | O13 | Japanese-locale launch in the hook plugin (AppLocale is obsolete): reimplement, or point to external tools? | Point to external tools. |
