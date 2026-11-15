@@ -225,6 +225,73 @@ impl std::error::Error for TextInputError {}
 /// Default maximum number of in-memory history entries.
 pub const DEFAULT_HISTORY_CAPACITY: usize = 10_000;
 
+/// Default UTF-8 byte limit for text retained in each context.
+pub const DEFAULT_CONTEXT_TEXT_HISTORY_BYTES: usize = 64 * 1024;
+
+/// Per-context text history bounded independently by UTF-8 byte size.
+#[derive(Clone, Debug)]
+pub struct ContextTextHistory {
+    contexts: HashMap<ContextId, (std::collections::VecDeque<String>, usize)>,
+    max_bytes: usize,
+}
+
+impl Default for ContextTextHistory {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_CONTEXT_TEXT_HISTORY_BYTES)
+    }
+}
+
+impl ContextTextHistory {
+    /// Create per-context histories with the specified byte limit.
+    pub fn with_capacity(max_bytes: usize) -> Self {
+        Self {
+            contexts: HashMap::new(),
+            max_bytes,
+        }
+    }
+
+    /// Add text, evicting oldest whole entries until it fits. Oversized text is ignored.
+    pub fn push(&mut self, context: ContextId, text: impl Into<String>) {
+        let text = text.into();
+        let size = text.len();
+        if self.max_bytes == 0 || size == 0 || size > self.max_bytes {
+            return;
+        }
+        let (entries, bytes) = self.contexts.entry(context).or_default();
+        while *bytes > self.max_bytes - size {
+            if let Some(oldest) = entries.pop_front() {
+                *bytes -= oldest.len();
+            }
+        }
+        entries.push_back(text);
+        *bytes += size;
+    }
+
+    /// Remove all retained text for one context.
+    pub fn clear(&mut self, context: &ContextId) {
+        self.contexts.remove(context);
+    }
+
+    /// Retained text in insertion order, or an empty vector for an untracked context.
+    pub fn entries(&self, context: &ContextId) -> Vec<&str> {
+        self.contexts
+            .get(context)
+            .map_or_else(Vec::new, |(entries, _)| {
+                entries.iter().map(String::as_str).collect()
+            })
+    }
+
+    /// Total retained UTF-8 bytes for one context.
+    pub fn bytes(&self, context: &ContextId) -> usize {
+        self.contexts.get(context).map_or(0, |(_, bytes)| *bytes)
+    }
+
+    /// Number of contexts currently retaining entries.
+    pub fn context_count(&self) -> usize {
+        self.contexts.len()
+    }
+}
+
 /// Opaque, typed identity for a history entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct HistoryEntryId(u64);
@@ -591,6 +658,40 @@ mod tests {
     fn default_history_capacity_is_ten_thousand() {
         assert_eq!(History::default().capacity(), DEFAULT_HISTORY_CAPACITY);
         assert_eq!(DEFAULT_HISTORY_CAPACITY, 10_000);
+    }
+
+    #[test]
+    fn text_history_counts_utf8_bytes_evicts_whole_entries_and_clears_in_isolation() {
+        let a = ContextId::new("api:a").unwrap();
+        let b = ContextId::new("api:b").unwrap();
+        let mut h = ContextTextHistory::with_capacity(5);
+        h.push(a.clone(), "éé");
+        assert_eq!(h.bytes(&a), 4);
+        h.push(a.clone(), "xy");
+        h.push(b.clone(), "kept");
+        assert_eq!(h.entries(&a), &["xy"]);
+        assert_eq!(h.bytes(&a), 2);
+        assert_eq!(h.bytes(&b), 4);
+        h.clear(&a);
+        assert!(h.entries(&a).is_empty());
+        assert_eq!(h.entries(&b), &["kept"]);
+    }
+
+    #[test]
+    fn text_history_discards_oversized_entries_and_handles_repeated_pushes() {
+        let context = ContextId::new("api:a").unwrap();
+        let mut h = ContextTextHistory::with_capacity(3);
+        h.push(context.clone(), "large");
+        assert!(h.entries(&context).is_empty());
+        for _ in 0..20 {
+            h.push(context.clone(), "ab");
+            h.push(context.clone(), "");
+        }
+        assert_eq!(h.entries(&context), &["ab"]);
+        assert_eq!(h.bytes(&context), 2);
+        assert_eq!(h.context_count(), 1);
+        h.clear(&context);
+        assert_eq!(h.context_count(), 0);
     }
 
     #[test]

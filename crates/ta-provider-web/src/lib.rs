@@ -1,5 +1,5 @@
 //! Declarative web translation provider schema, mapping, and HTTP transport.
-//! Unsupported here: sessions, secret resolution, retries, auth flows, and advanced JSONPath.
+//! Unsupported here: sessions, OS credential storage, retries, auth flows, and advanced JSONPath.
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +9,9 @@ use std::{collections::BTreeMap, fmt};
 /// A declarative web translation provider configuration.
 /// Provider identity and capabilities.
 pub struct ProviderDefinition {
+    #[serde(default)]
+    /// Non-secret parameter declarations and defaults.
+    pub params: BTreeMap<String, ParamDefinition>,
     #[serde(default)]
     /// Provider identity and limits.
     pub provider: Provider,
@@ -22,6 +25,24 @@ pub struct ProviderDefinition {
     /// Response fields used to extract translation results.
     pub response: Response,
 }
+
+/// A non-secret user parameter declared by a provider preset.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ParamDefinition {
+    /// Label displayed when the user sets this parameter.
+    #[serde(default)]
+    pub label: String,
+    /// Kind of input accepted by settings (for example, text or choice).
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    /// Optional non-secret default; absent values still need user setup.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Choices for a selection field, if any.
+    #[serde(default)]
+    pub choices: Option<toml::Value>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 /// Provider identity and basic input limits.
 pub struct Provider {
@@ -139,6 +160,8 @@ pub enum ProviderError {
     Invalid(String),
     /// A placeholder is unsupported or malformed.
     Template(String),
+    /// A secret required by the request was not injected.
+    NeedsSecret(String),
     /// The response did not contain a valid translation.
     Response(String),
     /// HTTP transport failed.
@@ -156,7 +179,7 @@ impl fmt::Display for ProviderError {
     }
 }
 impl std::error::Error for ProviderError {}
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 /// Request data after applying translation placeholders.
 pub struct MappedRequest {
     /// HTTP method.
@@ -170,13 +193,24 @@ pub struct MappedRequest {
     /// Mapped JSON body, if configured.
     pub body: Option<Value>,
 }
+impl fmt::Debug for MappedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MappedRequest")
+            .field("method", &self.method)
+            .field("url", &"[redacted]")
+            .field("query", &"[redacted]")
+            .field("headers", &"[redacted]")
+            .field("body", &"[redacted]")
+            .finish()
+    }
+}
 
 fn prune_unknown(value: &mut toml::Value, path: &str, warnings: &mut Vec<String>) {
     let Some(table) = value.as_table_mut() else {
         return;
     };
     let schema: &[&str] = match path {
-        "" => &["provider", "languages", "request", "response"],
+        "" => &["provider", "languages", "request", "response", "params"],
         "provider" => &[
             "id",
             "name",
@@ -523,6 +557,17 @@ impl ValidatedProvider {
         source: &str,
         target: &str,
     ) -> Result<MappedRequest, ProviderError> {
+        self.map_request_with_values(text, source, target, &BTreeMap::new(), &BTreeMap::new())
+    }
+    /// Maps a request with externally supplied parameter and secret values.
+    pub fn map_request_with_values(
+        &self,
+        text: &str,
+        source: &str,
+        target: &str,
+        params: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+    ) -> Result<MappedRequest, ProviderError> {
         if text.chars().count() > self.0.provider.max_chars {
             return Err(ProviderError::Invalid(format!(
                 "text exceeds max_chars ({})",
@@ -539,6 +584,51 @@ impl ValidatedProvider {
             ));
         }
         let r = &self.0.request;
+        let mut values: BTreeMap<String, String> = self
+            .0
+            .params
+            .iter()
+            .filter_map(|(name, definition)| {
+                definition
+                    .default
+                    .as_ref()
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect();
+        values.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for key in template_keys(r) {
+            if let Some((kind, name)) = key.split_once('.') {
+                if kind == "secret" && secrets.get(name).is_none_or(|value| value.is_empty()) {
+                    return Err(ProviderError::NeedsSecret(name.to_owned()));
+                }
+                if kind == "param" && !values.contains_key(name) {
+                    return Err(ProviderError::Template(format!(
+                        "Needs setup: parameter {name}"
+                    )));
+                }
+            }
+        }
+        if let Some((name, _)) = r
+            .url
+            .strip_prefix("{{param.")
+            .and_then(|url| url.split_once("}}"))
+        {
+            let server = values.get(name).expect("checked parameter");
+            let valid = reqwest::Url::parse(server).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            });
+            if !valid {
+                return Err(ProviderError::Template(format!(
+                    "Needs setup: parameter {name} must be a server URL"
+                )));
+            }
+        }
         let languages = &self.0.languages;
         let omit_source = source == "auto" && languages.auto.as_deref() == Some("");
         let source = if source == "auto" {
@@ -566,32 +656,55 @@ impl ValidatedProvider {
                 "auto source cannot be omitted from a mixed template".into(),
             ));
         }
-        Ok(MappedRequest {
+        let mapped = MappedRequest {
             method: r.method.clone(),
-            url: substitute(&r.url, text, source, target, Context::Url),
+            url: substitute_values(&r.url, text, source, target, Context::Url, &values, secrets),
             query: r
                 .query
                 .iter()
                 .filter(|(_, v)| !omit_source || v.as_str() != "{{src}}")
-                .map(|(k, v)| (k.clone(), substitute(v, text, source, target, Context::Raw)))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        substitute_values(v, text, source, target, Context::Raw, &values, secrets),
+                    )
+                })
                 .collect(),
             headers: r
                 .headers
                 .iter()
-                .map(|(k, v)| (k.clone(), substitute(v, text, source, target, Context::Raw)))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        substitute_values(v, text, source, target, Context::Raw, &values, secrets),
+                    )
+                })
                 .collect(),
             body: r
                 .body
                 .as_ref()
                 .map(|b| {
                     if omit_source {
-                        map_json_without_source(&b.json, text, target)
+                        map_json_without_source(&b.json, text, target, &values, secrets)
                     } else {
-                        Ok(map_json(&b.json, text, source, target))
+                        Ok(map_json_with_values(
+                            &b.json, text, source, target, &values, secrets,
+                        ))
                     }
                 })
                 .transpose()?,
-        })
+        };
+        let has_secret = template_keys(r)
+            .iter()
+            .any(|key| key.starts_with("secret."))
+            || !literal_credential_warnings(&r.headers, r.body.as_ref().map(|body| &body.json))
+                .is_empty();
+        if requires_insecure_http_confirmation(&mapped.url, has_secret) {
+            return Err(ProviderError::Invalid(
+                "HTTP with a secret requires explicit user confirmation".into(),
+            ));
+        }
+        Ok(mapped)
     }
     /// Extracts a translation string from a JSON response.
     pub fn extract_translation(&self, response: &Value) -> Result<String, ProviderError> {
@@ -717,35 +830,181 @@ enum Context {
     Raw,
     Url,
 }
-fn substitute(s: &str, text: &str, src: &str, dst: &str, ctx: Context) -> String {
+
+fn substitute_values(
+    template: &str,
+    text: &str,
+    source: &str,
+    target: &str,
+    context: Context,
+    params: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+) -> String {
     let mut out = String::new();
-    let mut i = 0;
-    while i < s.len() {
-        if s[i..].starts_with("{{")
-            && let Some(end) = s[i + 2..].find("}}")
+    let mut offset = 0;
+    while offset < template.len() {
+        if template[offset..].starts_with("{{")
+            && let Some(end) = template[offset + 2..].find("}}")
         {
-            let key = &s[i + 2..i + 2 + end];
-            let val = match key {
+            let name = &template[offset + 2..offset + 2 + end];
+            let value = match name {
                 "text" => Some(text),
-                "src" => Some(src),
-                "dst" => Some(dst),
-                _ => None,
+                "src" => Some(source),
+                "dst" => Some(target),
+                _ => name
+                    .strip_prefix("param.")
+                    .and_then(|key| params.get(key).map(String::as_str))
+                    .or_else(|| {
+                        name.strip_prefix("secret.")
+                            .and_then(|key| secrets.get(key).map(String::as_str))
+                    }),
             };
-            if let Some(val) = val {
-                out.push_str(&match ctx {
-                    Context::Raw => val.to_owned(),
-                    Context::Url => percent_encode(val),
-                });
-                i += end + 4;
+            if let Some(value) = value {
+                match context {
+                    Context::Raw => out.push_str(value),
+                    Context::Url
+                        if offset == 0
+                            && name.starts_with("param.")
+                            && (value.starts_with("http://") || value.starts_with("https://")) =>
+                    {
+                        out.push_str(value.trim_end_matches('/'));
+                    }
+                    Context::Url => out.push_str(&percent_encode(value)),
+                }
+                offset += end + 4;
                 continue;
             }
         }
-        let ch = s[i..].chars().next().unwrap();
+        let ch = template[offset..].chars().next().expect("remaining text");
         out.push(ch);
-        i += ch.len_utf8();
+        offset += ch.len_utf8();
     }
     out
 }
+
+fn map_json_with_values(
+    value: &Value,
+    text: &str,
+    source: &str,
+    target: &str,
+    params: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+) -> Value {
+    match value {
+        Value::String(value) => Value::String(substitute_values(
+            value,
+            text,
+            source,
+            target,
+            Context::Raw,
+            params,
+            secrets,
+        )),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| map_json_with_values(value, text, source, target, params, secrets))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        map_json_with_values(value, text, source, target, params, secrets),
+                    )
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+#[cfg(test)]
+fn map_json(value: &Value, text: &str, source: &str, target: &str) -> Value {
+    map_json_with_values(
+        value,
+        text,
+        source,
+        target,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+}
+
+fn map_json_without_source(
+    value: &Value,
+    text: &str,
+    target: &str,
+    params: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+) -> Result<Value, ProviderError> {
+    match value {
+        Value::Object(values) => values
+            .iter()
+            .filter(|(_, value)| value.as_str() != Some("{{src}}"))
+            .map(|(key, value)| {
+                Ok((
+                    key.clone(),
+                    map_json_without_source(value, text, target, params, secrets)?,
+                ))
+            })
+            .collect::<Result<serde_json::Map<String, Value>, ProviderError>>()
+            .map(Value::Object),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| map_json_without_source(value, text, target, params, secrets))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::String(value) if value.contains("{{src}}") => Err(ProviderError::Template(
+            "auto source cannot be omitted from a mixed template".into(),
+        )),
+        _ => Ok(map_json_with_values(
+            value, text, "", target, params, secrets,
+        )),
+    }
+}
+
+fn template_keys(request: &Request) -> Vec<String> {
+    fn collect_from_value(value: &Value, templates: &mut Vec<String>) {
+        match value {
+            Value::String(text) => templates.push(text.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    collect_from_value(item, templates);
+                }
+            }
+            Value::Object(items) => {
+                for item in items.values() {
+                    collect_from_value(item, templates);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut templates = vec![request.url.clone()];
+    templates.extend(request.query.values().cloned());
+    templates.extend(request.headers.values().cloned());
+    if let Some(body) = &request.body {
+        collect_from_value(&body.json, &mut templates);
+    }
+    let mut keys = Vec::new();
+    for template in templates {
+        let mut remaining = template.as_str();
+        while let Some(start) = remaining.find("{{") {
+            remaining = &remaining[start + 2..];
+            if let Some(end) = remaining.find("}}") {
+                keys.push(remaining[..end].to_owned());
+                remaining = &remaining[end + 2..];
+            } else {
+                break;
+            }
+        }
+    }
+    keys
+}
+
 fn validate_template(s: &str) -> Result<(), ProviderError> {
     let mut rest = s;
     while let Some(i) = rest.find("{{") {
@@ -753,7 +1012,7 @@ fn validate_template(s: &str) -> Result<(), ProviderError> {
         let e = rest
             .find("}}")
             .ok_or_else(|| ProviderError::Template("unclosed placeholder".into()))?;
-        if !matches!(&rest[..e], "text" | "src" | "dst") {
+        if !matches!(&rest[..e], "text" | "src" | "dst") && !valid_named_placeholder(&rest[..e]) {
             return Err(ProviderError::Template(format!(
                 "unsupported placeholder {{{{{}}}}}",
                 &rest[..e]
@@ -762,6 +1021,16 @@ fn validate_template(s: &str) -> Result<(), ProviderError> {
         rest = &rest[e + 2..];
     }
     Ok(())
+}
+fn valid_named_placeholder(key: &str) -> bool {
+    let Some((kind, name)) = key.split_once('.') else {
+        return false;
+    };
+    matches!(kind, "param" | "secret")
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
 }
 fn percent_encode(s: &str) -> String {
     let mut o = String::new();
@@ -774,38 +1043,6 @@ fn percent_encode(s: &str) -> String {
     }
     o
 }
-fn map_json(v: &Value, t: &str, s: &str, d: &str) -> Value {
-    match v {
-        Value::String(x) => Value::String(substitute(x, t, s, d, Context::Raw)),
-        Value::Array(a) => Value::Array(a.iter().map(|x| map_json(x, t, s, d)).collect()),
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| (k.clone(), map_json(x, t, s, d)))
-                .collect(),
-        ),
-        _ => v.clone(),
-    }
-}
-fn map_json_without_source(v: &Value, text: &str, target: &str) -> Result<Value, ProviderError> {
-    match v {
-        Value::Object(values) => values
-            .iter()
-            .filter(|(_, value)| value.as_str() != Some("{{src}}"))
-            .map(|(key, value)| Ok((key.clone(), map_json_without_source(value, text, target)?)))
-            .collect::<Result<serde_json::Map<String, Value>, ProviderError>>()
-            .map(Value::Object),
-        Value::Array(values) => values
-            .iter()
-            .map(|value| map_json_without_source(value, text, target))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        Value::String(s) if s.contains("{{src}}") => Err(ProviderError::Template(
-            "auto source cannot be omitted from a mixed template".into(),
-        )),
-        _ => Ok(map_json(v, text, "", target)),
-    }
-}
-
 fn validate_json(v: &Value) -> Result<(), ProviderError> {
     match v {
         Value::String(s) => validate_template(s),
@@ -990,6 +1227,42 @@ mod tests {
             true
         ));
         assert!(warnings.contains("requires explicit user confirmation"));
+    }
+
+    #[test]
+    fn runtime_params_and_secrets_map_without_exposing_values() {
+        let source = "[provider]\nid='preset'\nname='Preset'\n[params]\nserver={label='Server', type='text'}\n[request]\nmethod='POST'\nurl='{{param.server}}/translate'\nheaders={Authorization='Bearer {{secret.api-key}}'}\nbody.json={q='{{text}}', api_key='{{secret.api-key}}'}\n[response]\ntext={jsonpath='$.translatedText'}\n";
+        let provider = ProviderDefinition::from_toml(source).unwrap();
+        let mut params = BTreeMap::new();
+        let mut secrets = BTreeMap::new();
+        assert!(matches!(
+            provider.map_request("a&b", "ja", "en"),
+            Err(ProviderError::Template(_))
+        ));
+        params.insert("server".into(), "https://example.org".into());
+        assert!(
+            matches!(provider.map_request_with_values("a&b", "ja", "en", &params, &secrets), Err(ProviderError::NeedsSecret(name)) if name == "api-key")
+        );
+        secrets.insert("api-key".into(), "private value".into());
+        let mapped = provider
+            .map_request_with_values("a&b", "ja", "en", &params, &secrets)
+            .unwrap();
+        assert_eq!(mapped.url, "https://example.org/translate");
+        assert_eq!(mapped.headers["Authorization"], "Bearer private value");
+        assert_eq!(mapped.body.as_ref().unwrap()["q"], "a&b");
+        assert_eq!(mapped.body.as_ref().unwrap()["api_key"], "private value");
+        assert!(!format!("{mapped:?}").contains("private value"));
+        secrets.insert("api-key".into(), String::new());
+        assert!(matches!(
+            provider.map_request_with_values("a&b", "ja", "en", &params, &secrets),
+            Err(ProviderError::NeedsSecret(_))
+        ));
+        secrets.insert("api-key".into(), "private value".into());
+        params.insert("server".into(), "http://example.org".into());
+        assert!(matches!(
+            provider.map_request_with_values("a&b", "ja", "en", &params, &secrets),
+            Err(ProviderError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -1318,9 +1591,10 @@ error = { jsonpath = "$.error" }
     }
     #[test]
     fn secret_placeholder_fails_closed() {
+        let provider = ProviderDefinition::from_toml(LIBRE).unwrap();
         assert!(matches!(
-            ProviderDefinition::from_toml(LIBRE),
-            Err(ProviderError::Template(_))
+            provider.map_request("hello", "ja", "en"),
+            Err(ProviderError::NeedsSecret(name)) if name == "libre-key"
         ));
     }
     #[test]
