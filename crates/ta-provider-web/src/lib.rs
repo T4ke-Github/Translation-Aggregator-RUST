@@ -709,20 +709,47 @@ impl ValidatedProvider {
     /// Extracts a translation string from a JSON response.
     pub fn extract_translation(&self, response: &Value) -> Result<String, ProviderError> {
         let selector = &self.0.response.text;
+        self.extract_json_matches(response, selector)
+            .map(|(text, _)| text)
+    }
+
+    /// Extracts text and reports how many non-null values matched for the Test view.
+    pub fn extract_translation_with_match_count(
+        &self,
+        response: &Value,
+    ) -> Result<(String, usize), ProviderError> {
+        self.extract_json_matches(response, &self.0.response.text)
+    }
+
+    fn extract_json_matches(
+        &self,
+        response: &Value,
+        selector: &Selector,
+    ) -> Result<(String, usize), ProviderError> {
         let matches = select_json_many(response, &selector.jsonpath)?;
-        let strings = matches
+        let values = matches
             .into_iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| ProviderError::Response("selected value is not a string".into()))
+            .filter(|value| !value.is_null())
+            .map(|value| match value {
+                Value::String(text) => Ok(text.clone()),
+                Value::Number(number) => Ok(number.to_string()),
+                _ => Err(ProviderError::Response(
+                    "selected value is not text or a number".into(),
+                )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        match &selector.join {
-            Some(separator) => Ok(strings.join(separator)),
-            None if strings.len() == 1 => Ok(strings.into_iter().next().expect("one match")),
-            None => Ok(strings.into_iter().next().expect("matches are nonempty")),
+        if values.is_empty() {
+            return Err(ProviderError::Response(format!(
+                "path {} did not match",
+                selector.jsonpath
+            )));
         }
+        let count = values.len();
+        let text = match &selector.join {
+            Some(separator) => values.join(separator),
+            None => values.into_iter().next().expect("nonempty matches"),
+        };
+        Ok((text, count))
     }
 
     /// Checks configured provider errors before extracting translation text from raw bytes.
@@ -734,7 +761,11 @@ impl ValidatedProvider {
         {
             let re = regex::Regex::new(pattern)
                 .map_err(|e| ProviderError::Invalid(format!("invalid error regex: {e}")))?;
-            if let Some(message) = re.captures(&raw).and_then(|c| c.get(1)) {
+            if let Some(message) = re
+                .captures(&raw)
+                .and_then(|c| c.get(1))
+                .filter(|m| !m.as_str().is_empty())
+            {
                 return Err(ProviderError::Response(format!(
                     "{}: {}",
                     self.0.provider.name,
@@ -763,9 +794,16 @@ impl ValidatedProvider {
                 .map_err(|_| ProviderError::Response("Reply was not JSON".into()))?;
             if let Some(error_selector) = &self.0.response.error
                 && !error_selector.jsonpath.is_empty()
-                && let Ok(error) = select_json(&json, &error_selector.jsonpath)
+                && let Ok(error) = select_json_many(&json, &error_selector.jsonpath)
             {
-                let message = error.as_str().unwrap_or("");
+                let message = error
+                    .into_iter()
+                    .find_map(|value| match value {
+                        Value::String(text) if !text.is_empty() => Some(text.clone()),
+                        Value::Number(number) => Some(number.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 if !message.is_empty() {
                     return Err(ProviderError::Response(format!(
                         "{}: {message}",
@@ -773,7 +811,19 @@ impl ValidatedProvider {
                     )));
                 }
             }
-            self.extract_translation(&json)?
+            let (text, count) = self
+                .extract_json_matches(&json, selector)
+                .map_err(|error| match error {
+                    ProviderError::Response(message) if message.starts_with("path ") => {
+                        ProviderError::Response(format!(
+                            "Translation not found in reply (path `{}` matched nothing)",
+                            selector.jsonpath
+                        ))
+                    }
+                    other => other,
+                })?;
+            let _match_count_for_test_view = count;
+            text
         };
         if self.0.response.html_decode {
             result = decode_html_entities(&result);
@@ -802,19 +852,6 @@ fn select_json_many<'a>(response: &'a Value, path: &str) -> Result<Vec<&'a Value
         }
     }
     Ok(current)
-}
-
-fn select_json<'a>(response: &'a Value, path: &str) -> Result<&'a Value, ProviderError> {
-    let mut value = response;
-    for segment in segments(path)? {
-        value = match segment {
-            Segment::Key(key) => value.get(key),
-            Segment::Index(index) => value.get(index),
-            Segment::Wildcard => None,
-        }
-        .ok_or_else(|| ProviderError::Response(format!("path {path} did not match")))?;
-    }
-    Ok(value)
 }
 
 fn decode_html_entities(s: &str) -> String {
@@ -1777,11 +1814,40 @@ error = { jsonpath = "$.error" }
             .replace(", api_key = \"{{secret.libre-key}}\"", "")
             .replace("$.translatedText", "$.items[*].text");
         let provider = ProviderDefinition::from_toml(&source).unwrap();
-        assert!(matches!(
+        assert_eq!(
             provider
-                .extract_translation(&serde_json::json!({"items":[{"text":"A"},{"text":null}]})),
+                .extract_translation(&serde_json::json!({"items":[{"text":"A"},{"text":null}]}))
+                .unwrap(),
+            "A"
+        );
+        assert!(matches!(
+            provider.extract_translation(
+                &serde_json::json!({"items":[{"text":null},{"text":{"nested":true}}]})
+            ),
             Err(ProviderError::Response(_))
         ));
+    }
+
+    #[test]
+    fn nested_wildcards_skip_null_and_join_numbers() {
+        let source = LIBRE
+            .replace(", api_key = \"{{secret.libre-key}}\"", "")
+            .replace("$.translatedText", "$[0][*][0]")
+            .replace(
+                "text = { jsonpath = \"$[0][*][0]\" }",
+                "text = { jsonpath = \"$[0][*][0]\", join = \"-\" }",
+            );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        assert_eq!(
+            provider
+                .extract_translation_with_match_count(&serde_json::json!([[
+                    ["A", null],
+                    ["B"],
+                    [4]
+                ]]))
+                .unwrap(),
+            ("A-B-4".into(), 3)
+        );
     }
 
     #[test]
@@ -1814,11 +1880,14 @@ error = { jsonpath = "$.error" }
     #[test]
     fn response_extraction_supports_regex_join_and_html_entities() {
         let s = "[provider]\nid='test'\nname='Test'\n[request]\nmethod='GET'\nurl='https://example.test'\n[response]\nhtml_decode=true\ntext={regex='<span>(.*?)</span>', join=' | '}";
-        let p = ProviderDefinition::from_toml(s).unwrap();
+        let provider = ProviderDefinition::from_toml(s).unwrap();
         assert_eq!(
-            p.extract_translation_from_bytes(b"<span>A &amp; B</span><span>&quot;C&quot;</span>")
+            provider
+                .extract_translation_from_bytes(
+                    br#"<span>A &amp; B</span><span>&#39;C&#39;</span>"#
+                )
                 .unwrap(),
-            "A & B | \"C\""
+            "A & B | 'C'"
         );
     }
 }
