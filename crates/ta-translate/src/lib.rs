@@ -419,9 +419,305 @@ impl Default for ResultCache {
     }
 }
 
+/// Maximum threads used by one dispatcher call, even if a caller asks for more.
+pub const MAX_DISPATCH_WORKERS: usize = 8;
+
+/// Selection policy for a one-shot dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchMode {
+    /// Run only translators configured for automatic requests.
+    Automatic,
+    /// Run every enabled and unpaused translator.
+    TranslateAll,
+}
+
+/// Configured translator and its dispatch-time eligibility.
+pub struct DispatchTranslator {
+    /// Stable translator identifier.
+    pub id: String,
+    /// Whether this translator may receive requests.
+    pub enabled: bool,
+    /// Whether this translator is temporarily paused.
+    pub paused: bool,
+    /// Whether automatic requests are allowed for this translator.
+    pub auto_translate_enabled: bool,
+    /// One translation call; errors must be sanitized by the caller.
+    pub translate: Box<dyn FnOnce(String) -> Result<String, String> + Send + 'static>,
+}
+
+/// Outcome of one dispatched translator call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchStatus {
+    /// The translator returned a result.
+    Success,
+    /// The translator returned a sanitized error.
+    Error,
+}
+
+/// One translator completion delivered as soon as it finishes.
+#[derive(Clone, Debug)]
+pub struct DispatchCompletion {
+    /// Stable translator identifier.
+    pub id: String,
+    /// Translation or sanitized error.
+    pub result: Result<String, String>,
+    /// Time spent in the translator call.
+    pub elapsed: std::time::Duration,
+    /// Whether this result came from a cache.
+    pub cached: bool,
+    /// Result status for the consumer.
+    pub status: DispatchStatus,
+}
+
+/// Start a bounded one-shot fan-out; receive completions as individual calls finish.
+/// At most eight threads are created. Dropping the receiver does not cancel calls.
+pub fn dispatch_translators(
+    translators: Vec<DispatchTranslator>,
+    text: String,
+    mode: DispatchMode,
+    max_workers: usize,
+) -> std::sync::mpsc::Receiver<DispatchCompletion> {
+    use std::{
+        sync::{Arc, Mutex, mpsc},
+        time::Instant,
+    };
+    let (out_tx, out_rx) = mpsc::channel();
+    let jobs: Vec<_> = translators
+        .into_iter()
+        .filter(|translator| {
+            translator.enabled
+                && !translator.paused
+                && (mode == DispatchMode::TranslateAll || translator.auto_translate_enabled)
+        })
+        .collect();
+    if jobs.is_empty() {
+        return out_rx;
+    }
+    let count = max_workers.clamp(1, MAX_DISPATCH_WORKERS).min(jobs.len());
+    let (job_tx, job_rx) = mpsc::channel();
+    for job in jobs {
+        let _ = job_tx.send((job, text.clone()));
+    }
+    drop(job_tx);
+    let shared_rx = Arc::new(Mutex::new(job_rx));
+    let mut spawned = 0;
+    for _ in 0..count {
+        let jobs = Arc::clone(&shared_rx);
+        let output = out_tx.clone();
+        if std::thread::Builder::new()
+            .spawn(move || {
+                loop {
+                    let job = jobs.lock().expect("dispatch queue poisoned").recv();
+                    let Ok((translator, input)) = job else {
+                        break;
+                    };
+                    let start = Instant::now();
+                    let id = translator.id;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (translator.translate)(input)
+                    }))
+                    .unwrap_or_else(|_| Err("translator failed".into()));
+                    let status = if result.is_ok() {
+                        DispatchStatus::Success
+                    } else {
+                        DispatchStatus::Error
+                    };
+                    let _ = output.send(DispatchCompletion {
+                        id,
+                        result,
+                        elapsed: start.elapsed(),
+                        cached: false,
+                        status,
+                    });
+                }
+            })
+            .is_ok()
+        {
+            spawned += 1;
+        }
+    }
+    if spawned == 0 {
+        let jobs = shared_rx.lock().expect("dispatch queue poisoned");
+        while let Ok((translator, _)) = jobs.try_recv() {
+            let _ = out_tx.send(DispatchCompletion {
+                id: translator.id,
+                result: Err("translator worker unavailable".into()),
+                elapsed: std::time::Duration::ZERO,
+                cached: false,
+                status: DispatchStatus::Error,
+            });
+        }
+    }
+    drop(out_tx);
+    out_rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_reports_panics_and_keeps_later_jobs() {
+        use std::time::Duration;
+        let panicking = DispatchTranslator {
+            id: "broken".into(),
+            enabled: true,
+            paused: false,
+            auto_translate_enabled: true,
+            translate: Box::new(|_| panic!("private panic detail")),
+        };
+        let healthy = DispatchTranslator {
+            id: "healthy".into(),
+            enabled: true,
+            paused: false,
+            auto_translate_enabled: true,
+            translate: Box::new(Ok),
+        };
+        let rx = dispatch_translators(
+            vec![panicking, healthy],
+            "hello".into(),
+            DispatchMode::Automatic,
+            1,
+        );
+        let first = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(first.id, "broken");
+        assert_eq!(first.status, DispatchStatus::Error);
+        assert!(!format!("{:?}", first).contains("private panic detail"));
+        let second = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(second.id, "healthy");
+        assert_eq!(second.result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn dispatch_delivers_fast_results_before_a_blocked_provider() {
+        use std::{sync::mpsc, time::Duration};
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked = DispatchTranslator {
+            id: "blocked".into(),
+            enabled: true,
+            paused: false,
+            auto_translate_enabled: true,
+            translate: Box::new(move |text| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(text)
+            }),
+        };
+        let fast = |id: &str| DispatchTranslator {
+            id: id.to_owned(),
+            enabled: true,
+            paused: false,
+            auto_translate_enabled: true,
+            translate: Box::new(Ok),
+        };
+        let skipped = DispatchTranslator {
+            id: "disabled".into(),
+            enabled: false,
+            paused: false,
+            auto_translate_enabled: true,
+            translate: Box::new(|_| panic!("disabled translator was called")),
+        };
+        let rx = dispatch_translators(
+            vec![blocked, fast("one"), fast("two"), skipped],
+            "hello".into(),
+            DispatchMode::Automatic,
+            3,
+        );
+        started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let first = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut ids = [first.id.as_str(), second.id.as_str()];
+        ids.sort();
+        assert_eq!(ids, ["one", "two"]);
+        assert!(first.result.is_ok() && second.result.is_ok());
+        assert!(!first.cached && !second.cached);
+        release_tx.send(()).unwrap();
+        let last = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(last.id, "blocked");
+        assert_eq!(last.result.unwrap(), "hello");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn dispatch_manual_override_keeps_disabled_and_paused_skipped() {
+        use std::time::Duration;
+        let translator = |id: &str, enabled, paused, auto_translate_enabled| DispatchTranslator {
+            id: id.to_owned(),
+            enabled,
+            paused,
+            auto_translate_enabled,
+            translate: Box::new(Ok),
+        };
+        let make = || {
+            vec![
+                translator("manual", true, false, false),
+                translator("auto", true, false, true),
+                translator("paused", true, true, true),
+                translator("disabled", false, false, true),
+            ]
+        };
+        let automatic = dispatch_translators(make(), "hi".into(), DispatchMode::Automatic, 2);
+        assert_eq!(
+            automatic.recv_timeout(Duration::from_secs(3)).unwrap().id,
+            "auto"
+        );
+        assert!(automatic.recv_timeout(Duration::from_millis(100)).is_err());
+        let manual = dispatch_translators(make(), "hi".into(), DispatchMode::TranslateAll, 2);
+        let mut ids = [
+            manual.recv_timeout(Duration::from_secs(3)).unwrap().id,
+            manual.recv_timeout(Duration::from_secs(3)).unwrap().id,
+        ];
+        ids.sort();
+        assert_eq!(ids, ["auto", "manual"]);
+        assert!(manual.recv_timeout(Duration::from_millis(100)).is_err());
+        let empty = dispatch_translators(vec![], "hi".into(), DispatchMode::TranslateAll, 4);
+        assert!(empty.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn dispatch_caps_its_worker_threads() {
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+        use std::time::Duration;
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let jobs = (0..12)
+            .map(|id| {
+                let started_tx = started_tx.clone();
+                let gate = Arc::clone(&gate);
+                DispatchTranslator {
+                    id: id.to_string(),
+                    enabled: true,
+                    paused: false,
+                    auto_translate_enabled: true,
+                    translate: Box::new(move |_| {
+                        started_tx.send(()).unwrap();
+                        let (lock, ready) = &*gate;
+                        let mut open = lock.lock().unwrap();
+                        while !*open {
+                            open = ready.wait(open).unwrap();
+                        }
+                        Ok("done".into())
+                    }),
+                }
+            })
+            .collect();
+        let rx = dispatch_translators(jobs, "hi".into(), DispatchMode::Automatic, 1000);
+        for _ in 0..MAX_DISPATCH_WORKERS {
+            started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        assert!(started_rx.try_recv().is_err());
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        for _ in 0..12 {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(3)).unwrap().status,
+                DispatchStatus::Success
+            );
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
 
     #[test]
     fn sentence_splitting_preserves_japanese_and_unicode_scalars() {
