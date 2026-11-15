@@ -4,6 +4,7 @@
 //! complete byte payloads via a same-directory temporary file.
 
 pub mod clipboard;
+pub mod credentials;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
