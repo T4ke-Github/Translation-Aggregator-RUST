@@ -129,9 +129,28 @@ fn run_with_provider(
     if !provider.definition().provider.enabled {
         return Err("provider is disabled".into());
     }
-    let request = provider
-        .map_request(&input.processed_text, source, target)
-        .map_err(|e| format!("provider request: {e}"))?;
+    let mut secrets = std::collections::BTreeMap::new();
+    let request = loop {
+        match provider.map_request_with_values(
+            &input.processed_text,
+            source,
+            target,
+            &std::collections::BTreeMap::new(),
+            &secrets,
+        ) {
+            Ok(request) => break request,
+            Err(ta_provider_web::ProviderError::NeedsSecret(name)) => {
+                if secrets.contains_key(&name) || secrets.len() >= 64 {
+                    return Err("Needs key".into());
+                }
+                let value = ta_platform::credentials::read_secret(&name)
+                    .map_err(|_| "Needs key (credential store unavailable)".to_owned())?
+                    .ok_or_else(|| "Needs key".to_owned())?;
+                secrets.insert(name, value);
+            }
+            Err(error) => return Err(format!("provider request: {error}")),
+        }
+    };
     if ta_provider_web::requires_insecure_http_confirmation(&request.url, true) {
         return Err("refusing non-loopback HTTP provider in console mode".into());
     }
@@ -350,6 +369,28 @@ mod tests {
         let result = run_with_provider("hello", "typed", &path, "en", "fr");
         fs::remove_file(path).unwrap();
         assert!(result.unwrap_err().contains("disabled"));
+    }
+
+    #[test]
+    fn missing_credential_fails_closed_before_sending() {
+        use std::fs;
+        let name = format!("missing-{}", std::process::id());
+        let definition = format!(
+            "[provider]\nid='smoke'\nname='Smoke'\nenabled=true\n[request]\nmethod='GET'\nurl='http://127.0.0.1:9/translate'\nheaders={{Authorization='Bearer {{{{secret.{name}}}}}'}}\n[response]\ntext={{jsonpath='$.translatedText'}}\n"
+        );
+        let path = std::env::current_dir().unwrap().join(format!(
+            "target/missing-key-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, definition).unwrap();
+        let result = run_with_provider("hello", "typed", &path, "en", "fr");
+        fs::remove_file(path).unwrap();
+        assert!(result.unwrap_err().contains("Needs key"));
     }
 
     #[test]
