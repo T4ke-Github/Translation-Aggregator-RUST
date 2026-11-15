@@ -815,6 +815,83 @@ pub struct SlidingWindowRateLimiter {
     window: u64,
     timestamps: std::collections::VecDeque<u64>,
 }
+
+/// One delayed retry, bound to the input generation that produced it.
+#[derive(Debug)]
+struct ScheduledRetry<T> {
+    generation: u64,
+    request: T,
+    due_at_ms: u64,
+}
+
+/// Pure, latest-generation retry scheduler. The caller supplies monotonic time and jitter seed.
+#[derive(Debug)]
+pub struct RetryCoordinator<T> {
+    generation: u64,
+    pending: Option<ScheduledRetry<T>>,
+}
+
+impl<T> RetryCoordinator<T> {
+    /// Create a scheduler for the current input generation.
+    pub fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            pending: None,
+        }
+    }
+
+    /// Replace current input only with a newer generation, cancelling its older retry.
+    pub fn replace_generation(&mut self, generation: u64) {
+        if generation > self.generation {
+            self.generation = generation;
+            self.pending = None;
+        }
+    }
+
+    /// Schedule a delay already approved by `retry_delay`; returns false past retry limit.
+    pub fn schedule(
+        &mut self,
+        generation: u64,
+        request: T,
+        retries_already_performed: u8,
+        now_ms: u64,
+        delay: std::time::Duration,
+    ) -> bool {
+        if generation != self.generation || retries_already_performed >= 2 {
+            return false;
+        }
+        self.pending = Some(ScheduledRetry {
+            generation,
+            request,
+            due_at_ms: now_ms.saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64),
+        });
+        true
+    }
+
+    /// Take due work only if its generation is current and the limiter admits it.
+    /// Rate-limited work remains pending for a later deterministic poll.
+    pub fn take_due(
+        &mut self,
+        now_ms: u64,
+        current_generation: u64,
+        limiter: &mut SlidingWindowRateLimiter,
+    ) -> Option<T> {
+        if current_generation != self.generation {
+            self.replace_generation(current_generation);
+            return None;
+        }
+        let pending = self.pending.as_ref()?;
+        if pending.generation != current_generation {
+            self.pending = None;
+            return None;
+        }
+        if now_ms < pending.due_at_ms || !limiter.allow_at(now_ms) {
+            return None;
+        }
+        self.pending.take().map(|retry| retry.request)
+    }
+}
+
 impl SlidingWindowRateLimiter {
     /// Create a limiter for at most `limit` admissions per `window` milliseconds.
     pub fn new(limit: usize, window: u64) -> Self {
@@ -1038,5 +1115,40 @@ mod retry_tests {
             retry_delay(RetryFailure::Timeout, 0, None, Duration::ZERO, 0, true),
             None
         );
+    }
+
+    #[test]
+    fn coordinator_schedules_due_retry_and_retains_rate_limited_work() {
+        let mut coordinator = RetryCoordinator::new(7);
+        let delay = retry_delay(
+            RetryFailure::Timeout,
+            0,
+            None,
+            Duration::from_secs(15),
+            0,
+            true,
+        )
+        .unwrap();
+        assert!(coordinator.schedule(7, "retry", 0, 100, delay));
+        let mut limiter = SlidingWindowRateLimiter::new(1, 100);
+        let due_at = 100 + delay.as_millis() as u64;
+        assert!(limiter.allow_at(due_at - 1));
+        assert_eq!(coordinator.take_due(due_at, 7, &mut limiter), None);
+        assert_eq!(
+            coordinator.take_due(due_at + 100, 7, &mut limiter),
+            Some("retry")
+        );
+    }
+
+    #[test]
+    fn coordinator_cancels_replaced_and_stale_work() {
+        let mut coordinator = RetryCoordinator::new(1);
+        assert!(coordinator.schedule(1, 1, 1, 0, Duration::from_millis(5)));
+        coordinator.replace_generation(2);
+        assert!(!coordinator.schedule(1, 9, 1, 0, Duration::ZERO));
+        assert!(coordinator.schedule(2, 2, 1, 0, Duration::ZERO));
+        let mut limiter = SlidingWindowRateLimiter::new(2, 100);
+        assert_eq!(coordinator.take_due(0, 1, &mut limiter), None);
+        assert_eq!(coordinator.take_due(0, 2, &mut limiter), Some(2));
     }
 }

@@ -1207,9 +1207,118 @@ pub fn requires_insecure_http_confirmation(url: &str, contains_secret: bool) -> 
     }
 }
 
+/// Build the disabled official LibreTranslate preset; its server address comes from settings.
+pub fn libretranslate_preset() -> ValidatedProvider {
+    const DEFINITION: &str = r#"
+[provider]
+id = "libretranslate"
+name = "LibreTranslate"
+max_chars = 5000
+[languages]
+auto = "auto"
+[params]
+server = { label = "Server address", type = "text" }
+[request]
+method = "POST"
+url = "{{param.server}}/translate"
+body.json = { q = "{{text}}", source = "{{src}}", target = "{{dst}}" }
+[response]
+text = { jsonpath = "$.translatedText" }
+error = { jsonpath = "$.error" }
+"#;
+    ProviderDefinition::from_toml(DEFINITION).expect("built-in LibreTranslate definition is valid")
+}
+
+/// Map a LibreTranslate call without a key, or inject a caller-supplied optional key.
+pub fn libretranslate_request(
+    provider: &ValidatedProvider,
+    text: &str,
+    source: &str,
+    target: &str,
+    params: &BTreeMap<String, String>,
+    key: Option<&str>,
+) -> Result<MappedRequest, ProviderError> {
+    if provider.definition().provider.id != "libretranslate" {
+        return Err(ProviderError::Invalid(
+            "expected LibreTranslate provider".into(),
+        ));
+    }
+    let mut mapped =
+        provider.map_request_with_values(text, source, target, params, &BTreeMap::new())?;
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        if requires_insecure_http_confirmation(&mapped.url, true) {
+            return Err(ProviderError::Invalid(
+                "HTTP with a secret requires explicit user confirmation".into(),
+            ));
+        }
+        if let Some(Value::Object(body)) = &mut mapped.body {
+            body.insert("api_key".into(), Value::String(key.to_owned()));
+        }
+    }
+    Ok(mapped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn libretranslate_preset_maps_keyless_and_keyed_requests() {
+        let provider = libretranslate_preset();
+        assert!(!provider.definition().provider.enabled);
+        let mut params = BTreeMap::new();
+        assert!(matches!(
+            libretranslate_request(&provider, "hello", "ja", "en", &params, None),
+            Err(ProviderError::Template(_))
+        ));
+        params.insert("server".into(), "http://127.0.0.1:5000".into());
+        let mapped =
+            libretranslate_request(&provider, "hello", "auto", "fr", &params, None).unwrap();
+        assert_eq!(mapped.method, "POST");
+        assert_eq!(mapped.url, "http://127.0.0.1:5000/translate");
+        assert_eq!(
+            mapped.body.unwrap(),
+            serde_json::json!({"q":"hello","source":"auto","target":"fr"})
+        );
+        let mapped =
+            libretranslate_request(&provider, "hello", "en", "fr", &params, Some("private-key"))
+                .unwrap();
+        assert_eq!(mapped.body.unwrap()["api_key"], "private-key");
+        params.insert("server".into(), "http://example.org".into());
+        assert!(matches!(
+            libretranslate_request(&provider, "hi", "en", "fr", &params, Some("private-key")),
+            Err(ProviderError::Invalid(_))
+        ));
+        assert_eq!(
+            provider
+                .extract_translation(&serde_json::json!({"translatedText":"bonjour"}))
+                .unwrap(),
+            "bonjour"
+        );
+    }
+
+    #[test]
+    fn libretranslate_preset_reads_recorded_local_reply_and_error() {
+        let provider = libretranslate_preset();
+        let (url, server) = serve_once(200, r#"{"translatedText":"bonjour"}"#);
+        let params = BTreeMap::from([("server".into(), url.trim_end_matches("/translate").into())]);
+        let request =
+            libretranslate_request(&provider, "こんにちは", "ja", "fr", &params, None).unwrap();
+        let result = provider
+            .extract_translation_from_bytes(&provider.send(&request).unwrap())
+            .unwrap();
+        assert_eq!(result, "bonjour");
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("POST /translate HTTP/1.1")
+        );
+        assert!(matches!(
+            provider.extract_translation_from_bytes(br#"{"error":"unsupported language"}"#),
+            Err(ProviderError::Response(message)) if message.contains("unsupported language")
+        ));
+    }
+
     #[test]
     fn provider_parse_exposes_safe_literal_key_and_http_warnings() {
         let source = "[provider]\nid='safe'\nname='Safe'\n[request]\nmethod='POST'\nurl='http://example.org'\nheaders={Authorization='Bearer PLACEHOLDER'}\nbody.json={api_key='PLACEHOLDER', q='{{text}}'}\n[response]\ntext={jsonpath='$.translatedText'}\n";
