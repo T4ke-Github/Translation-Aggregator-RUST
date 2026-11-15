@@ -50,6 +50,44 @@ impl SettingsDocument {
         })
     }
 
+    /// Save this document safely, refusing to replace malformed or newer settings files.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "newer settings schema is read-only",
+            ));
+        }
+        if path.exists() {
+            let current = fs::read(path)?;
+            let current = parse_settings_bytes(&current)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if !current.is_writable() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "existing settings use a newer schema",
+                ));
+            }
+        }
+        let mut source = self.source.clone();
+        if self.version == 1 {
+            if let Some(line) = source.lines().find(|line| {
+                line.trim_start()
+                    .strip_prefix("schema_version")
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            }) {
+                let line_with_ending = format!("{line}\n");
+                if source.contains(&line_with_ending) {
+                    source = source.replacen(&line_with_ending, "", 1);
+                } else {
+                    source = source.replacen(line, "", 1);
+                }
+            }
+            source = format!("schema_version = 1\n{source}");
+        }
+        atomic_save(path, source.as_bytes())
+    }
+
     /// Return the parsed settings schema version.
     pub fn version(&self) -> u64 {
         self.version
@@ -327,6 +365,59 @@ answer = 42 # comment\n";
         ] {
             assert!(SettingsDocument::parse(source).is_err());
         }
+    }
+
+    #[test]
+    fn safe_save_puts_version_first_and_retains_unknown_table_comments() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        let doc = SettingsDocument::parse(
+            "title = \"kept\" # note\n[future]\nanswer = 42 # future note\n",
+        )
+        .unwrap();
+        doc.save(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("schema_version = 1\n"));
+        assert!(saved.contains("title = \"kept\" # note"));
+        assert!(saved.contains("[future]\nanswer = 42 # future note"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn safe_save_moves_late_version_to_first_key() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        SettingsDocument::parse("value = 3\nschema_version = 1\n")
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("schema_version = 1\n")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn safe_save_refuses_future_and_corrupt_files_without_changing_bytes() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        let future = b"schema_version = 9\nvalue = 1\n";
+        fs::write(&path, future).unwrap();
+        let result = SettingsDocument::parse("value = 2\n").unwrap().save(&path);
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), future);
+        fs::write(&path, b"invalid = [\n").unwrap();
+        let corrupt = fs::read(&path).unwrap();
+        assert!(
+            SettingsDocument::parse("value = 2\n")
+                .unwrap()
+                .save(&path)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

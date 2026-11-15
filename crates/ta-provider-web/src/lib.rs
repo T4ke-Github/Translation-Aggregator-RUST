@@ -371,6 +371,47 @@ impl fmt::Display for FolderLoadError {
     }
 }
 impl ValidatedProvider {
+    /// Translate manual text by splitting it into sentence-aware provider-sized requests.
+    /// All chunks are validated and mapped before `transport` is invoked.
+    pub fn send_manual_with<F>(
+        &self,
+        text: &str,
+        source: &str,
+        target: &str,
+        mut transport: F,
+    ) -> Result<String, ProviderError>
+    where
+        F: FnMut(&MappedRequest) -> Result<Vec<u8>, ProviderError>,
+    {
+        let chunks =
+            ta_translate::split_sentences(text, self.0.provider.max_chars).map_err(|e| {
+                ProviderError::Invalid(format!(
+                    "Text too long for {} ({} characters, limit {})",
+                    self.0.provider.name, e.actual_chars, e.max_chars
+                ))
+            })?;
+        let requests = chunks
+            .iter()
+            .map(|chunk| self.map_request(chunk, source, target))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut translations = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let bytes = transport(request)?;
+            translations.push(self.extract_translation_from_bytes(&bytes)?);
+        }
+        Ok(translations.join(""))
+    }
+
+    /// Translate manual text using the live HTTP transport.
+    pub fn send_manual(
+        &self,
+        text: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<String, ProviderError> {
+        self.send_manual_with(text, source, target, |request| self.send(request))
+    }
+
     /// Returns the validated provider definition.
     pub fn definition(&self) -> &ProviderDefinition {
         &self.0
@@ -819,6 +860,43 @@ body.json = { q = "{{text}}", source = "{{src}}", target = "{{dst}}", api_key = 
 text = { jsonpath = "$.translatedText" }
 error = { jsonpath = "$.error" }
 "#;
+    #[test]
+    fn manual_send_splits_maps_and_joins_in_order() {
+        let source = "[provider]\nid = 'local'\nname = 'Local'\nmax_chars = 4\n[request]\nmethod = 'POST'\nurl = 'https://example.org'\nbody.json = { q = '{{text}}' }\n[response]\ntext = { jsonpath = '$.translatedText' }\n";
+        let provider = ProviderDefinition::from_toml(source).unwrap();
+        let mut seen = Vec::new();
+        let result = provider
+            .send_manual_with("A.界!B?", "ja", "en", |request| {
+                seen.push(
+                    request.body.as_ref().unwrap()["q"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let value =
+                    serde_json::json!({"translatedText": format!("<{}>", seen.last().unwrap())});
+                Ok(serde_json::to_vec(&value).unwrap())
+            })
+            .unwrap();
+        assert_eq!(seen, ["A.界!", "B?"]);
+        assert_eq!(result, "<A.界!><B?>");
+    }
+
+    #[test]
+    fn manual_send_rejects_long_sentence_before_transport() {
+        let source = "[provider]\nid = 'local'\nname = 'Local'\nmax_chars = 3\n[request]\nmethod = 'POST'\nurl = 'https://example.org'\nbody.json = { q = '{{text}}' }\n[response]\ntext = { jsonpath = '$.translatedText' }\n";
+        let provider = ProviderDefinition::from_toml(source).unwrap();
+        let mut calls = 0;
+        let error = provider
+            .send_manual_with("界界界界.", "auto", "en", |_| {
+                calls += 1;
+                Ok(Vec::new())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("Local (5 characters, limit 3)"));
+        assert_eq!(calls, 0);
+    }
+
     #[test]
     fn folder_loader_keeps_valid_files_and_reports_duplicates_and_parse_errors() {
         use std::fs;
