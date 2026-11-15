@@ -3,6 +3,8 @@
 //! These helpers resolve settings without consulting the process working directory and save
 //! complete byte payloads via a same-directory temporary file.
 
+pub mod clipboard;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

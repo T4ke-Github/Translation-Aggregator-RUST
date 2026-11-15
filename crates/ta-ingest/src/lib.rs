@@ -829,3 +829,5 @@ mod pipeline_tests {
         );
     }
 }
+mod clipboard_gate;
+pub use clipboard_gate::ClipboardGate;
