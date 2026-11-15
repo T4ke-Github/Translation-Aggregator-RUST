@@ -872,3 +872,171 @@ mod primitive_tests {
         assert!(l.allow_at(200));
     }
 }
+
+/// Failure classes considered by the provider retry policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryFailure {
+    /// A request exceeded its timeout.
+    Timeout,
+    /// The connection failed before a usable reply.
+    Connection,
+    /// The provider returned an HTTP status.
+    Http(u16),
+    /// Non-retryable application or response error.
+    Other,
+}
+
+/// Decide the delay before a retry. `retries` is the number already performed.
+/// Jitter is deterministic and bounded to 250 ms from the supplied seed.
+pub fn retry_delay(
+    failure: RetryFailure,
+    retries: u8,
+    retry_after_seconds: Option<u64>,
+    provider_timeout: std::time::Duration,
+    seed: u64,
+    generation_is_current: bool,
+) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    let transient = match failure {
+        RetryFailure::Timeout | RetryFailure::Connection => true,
+        RetryFailure::Http(code) => code == 429 || (500..=599).contains(&code),
+        RetryFailure::Other => false,
+    };
+    if !transient || retries >= 2 || !generation_is_current || provider_timeout.is_zero() {
+        return None;
+    }
+    let base = if let Some(seconds) = retry_after_seconds {
+        Duration::from_secs(seconds).min(provider_timeout)
+    } else {
+        let millis = if retries == 0 { 1_000u64 } else { 2_000u64 };
+        let mut x = seed
+            ^ (u64::from(retries)
+                .wrapping_add(1)
+                .wrapping_mul(0x9E3779B97F4A7C15));
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+        x ^= x >> 27;
+        let jitter_ms = x % 251;
+        Duration::from_millis(millis.saturating_add(jitter_ms))
+    };
+    Some(base.min(provider_timeout))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn classes_attempt_limits_stale_and_determinism() {
+        for failure in [
+            RetryFailure::Timeout,
+            RetryFailure::Connection,
+            RetryFailure::Http(429),
+            RetryFailure::Http(500),
+            RetryFailure::Http(599),
+        ] {
+            assert!(retry_delay(failure, 0, None, Duration::from_secs(15), 9, true).is_some());
+        }
+        for failure in [
+            RetryFailure::Http(400),
+            RetryFailure::Http(401),
+            RetryFailure::Http(499),
+            RetryFailure::Http(600),
+            RetryFailure::Other,
+        ] {
+            assert_eq!(
+                retry_delay(failure, 0, None, Duration::from_secs(15), 9, true),
+                None
+            );
+        }
+        assert_eq!(
+            retry_delay(
+                RetryFailure::Timeout,
+                2,
+                None,
+                Duration::from_secs(15),
+                1,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            retry_delay(
+                RetryFailure::Timeout,
+                0,
+                None,
+                Duration::from_secs(15),
+                1,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            retry_delay(
+                RetryFailure::Timeout,
+                0,
+                None,
+                Duration::from_secs(15),
+                1,
+                true
+            ),
+            retry_delay(
+                RetryFailure::Timeout,
+                0,
+                None,
+                Duration::from_secs(15),
+                1,
+                true
+            )
+        );
+    }
+    #[test]
+    fn backoffs_retry_after_and_timeout_are_bounded() {
+        let a = retry_delay(
+            RetryFailure::Connection,
+            0,
+            None,
+            Duration::from_secs(15),
+            0,
+            true,
+        )
+        .unwrap();
+        let b = retry_delay(
+            RetryFailure::Connection,
+            1,
+            None,
+            Duration::from_secs(15),
+            0,
+            true,
+        )
+        .unwrap();
+        assert!((Duration::from_secs(1)..=Duration::from_millis(1250)).contains(&a));
+        assert!((Duration::from_secs(2)..=Duration::from_millis(2250)).contains(&b));
+        assert_eq!(
+            retry_delay(
+                RetryFailure::Http(429),
+                0,
+                Some(u64::MAX),
+                Duration::from_secs(15),
+                0,
+                true
+            ),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            retry_delay(
+                RetryFailure::Http(429),
+                0,
+                Some(3),
+                Duration::from_secs(15),
+                0,
+                true
+            ),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            retry_delay(RetryFailure::Timeout, 0, None, Duration::ZERO, 0, true),
+            None
+        );
+    }
+}

@@ -13,6 +13,7 @@ name = "translation-aggregator"
 path = "src/main.rs"
 
 [dependencies]
+ta-core.workspace = true
 ta-ingest.workspace = true
 ta-substitute.workspace = true
 ta-dict.workspace = true

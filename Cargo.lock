@@ -886,6 +886,7 @@ dependencies = [
 name = "ta-gui"
 version = "0.0.0"
 dependencies = [
+ "ta-core",
  "ta-dict",
  "ta-ingest",
  "ta-morph",
