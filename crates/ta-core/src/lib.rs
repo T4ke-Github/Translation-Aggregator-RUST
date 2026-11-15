@@ -222,9 +222,253 @@ impl fmt::Display for TextInputError {
 
 impl std::error::Error for TextInputError {}
 
+/// Default maximum number of in-memory history entries.
+pub const DEFAULT_HISTORY_CAPACITY: usize = 10_000;
+
+/// Opaque, typed identity for a history entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HistoryEntryId(u64);
+
+impl HistoryEntryId {
+    /// Allocate a process-unique history entry identifier.
+    pub fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for HistoryEntryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Typed provider identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderId(String);
+
+impl ProviderId {
+    /// Create a provider identity, rejecting empty/whitespace identifiers.
+    pub fn new(value: impl Into<String>) -> Result<Self, ProviderIdError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(ProviderIdError);
+        }
+        Ok(Self(value))
+    }
+    /// Borrow the identifier string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Invalid provider identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderIdError;
+impl fmt::Display for ProviderIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("provider id must not be empty")
+    }
+}
+impl std::error::Error for ProviderIdError {}
+
+/// Provider request result or failure, preserving its message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderOutcome {
+    /// Successful processed provider text.
+    Result(String),
+    /// Provider error message.
+    Error(String),
+}
+
+/// Lifecycle state of a provider result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderStatus {
+    /// Request is still in progress.
+    Pending,
+    /// Request completed with a result.
+    Succeeded,
+    /// Request completed with an error.
+    Failed,
+}
+
+/// Per-provider outcome and request metadata for a history entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderHistory {
+    /// Provider text or error.
+    pub outcome: ProviderOutcome,
+    /// Provider lifecycle status.
+    pub status: ProviderStatus,
+    /// Request duration.
+    pub elapsed: std::time::Duration,
+    /// Whether this result came from cache.
+    pub cached: bool,
+}
+
+/// One processed input and all provider outcomes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryEntry {
+    /// Stable typed entry identity.
+    pub id: HistoryEntryId,
+    /// Time this entry was stored.
+    pub time: std::time::SystemTime,
+    /// Input context.
+    pub context: ContextId,
+    /// Submitted text.
+    pub original_text: String,
+    /// Text after preprocessing.
+    pub processed_text: String,
+    /// Per-provider result/error and metadata.
+    pub providers: HashMap<ProviderId, ProviderHistory>,
+}
+
+impl HistoryEntry {
+    /// Create a history entry with no provider outcomes yet.
+    pub fn new(
+        id: HistoryEntryId,
+        time: std::time::SystemTime,
+        context: ContextId,
+        original_text: impl Into<String>,
+        processed_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            time,
+            context,
+            original_text: original_text.into(),
+            processed_text: processed_text.into(),
+            providers: HashMap::new(),
+        }
+    }
+}
+
+/// Bounded, in-memory history. Persistence and navigation are separate concerns.
+#[derive(Clone, Debug)]
+pub struct History {
+    entries: std::collections::VecDeque<HistoryEntry>,
+    capacity: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_HISTORY_CAPACITY)
+    }
+}
+
+impl History {
+    /// Create a history with a configured maximum number of entries.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+    /// Insert an entry, evicting oldest entries as needed; returns its ID.
+    pub fn push(&mut self, entry: HistoryEntry) -> HistoryEntryId {
+        let id = entry.id;
+        if self.capacity == 0 {
+            return id;
+        }
+        while self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+        id
+    }
+    /// Find an entry by its typed ID.
+    pub fn get(&self, id: &HistoryEntryId) -> Option<&HistoryEntry> {
+        self.entries.iter().find(|entry| &entry.id == id)
+    }
+    /// Number of retained entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// Whether no entries are retained.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    /// Maximum number of retained entries.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    /// Iterate over entries from oldest to newest.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &HistoryEntry> {
+        self.entries.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_stores_provider_metadata_and_evicts_oldest_entry() {
+        let context = ContextId::new("api:game").unwrap();
+        let mut history = History::with_capacity(2);
+        let first_id = HistoryEntryId::new();
+        let first = HistoryEntry::new(
+            first_id,
+            std::time::SystemTime::UNIX_EPOCH,
+            context.clone(),
+            "original",
+            "processed",
+        );
+        let second_id = HistoryEntryId::new();
+        let mut second = HistoryEntry::new(
+            second_id,
+            std::time::SystemTime::UNIX_EPOCH,
+            context.clone(),
+            "two",
+            "two",
+        );
+        second.providers.insert(
+            ProviderId::new("provider-a").unwrap(),
+            ProviderHistory {
+                outcome: ProviderOutcome::Result("translated".into()),
+                status: ProviderStatus::Succeeded,
+                elapsed: std::time::Duration::from_millis(23),
+                cached: true,
+            },
+        );
+        history.push(first);
+        history.push(second);
+        let third_id = HistoryEntryId::new();
+        history.push(HistoryEntry::new(
+            third_id,
+            std::time::SystemTime::UNIX_EPOCH,
+            context,
+            "three",
+            "three",
+        ));
+
+        assert_eq!(history.capacity(), 2);
+        assert_eq!(history.len(), 2);
+        assert!(history.get(&first_id).is_none());
+        assert!(history.get(&second_id).is_some());
+        let stored = history.get(&third_id).unwrap();
+        assert_eq!(stored.original_text, "three");
+        let earlier = history.get(&second_id).unwrap();
+        assert_eq!(
+            earlier.providers[&ProviderId::new("provider-a").unwrap()].outcome,
+            ProviderOutcome::Result("translated".into())
+        );
+        assert_eq!(
+            earlier.providers[&ProviderId::new("provider-a").unwrap()].status,
+            ProviderStatus::Succeeded
+        );
+        assert_eq!(
+            earlier.providers[&ProviderId::new("provider-a").unwrap()].elapsed,
+            std::time::Duration::from_millis(23)
+        );
+        assert!(earlier.providers[&ProviderId::new("provider-a").unwrap()].cached);
+    }
+
+    #[test]
+    fn default_history_capacity_is_ten_thousand() {
+        assert_eq!(History::default().capacity(), DEFAULT_HISTORY_CAPACITY);
+        assert_eq!(DEFAULT_HISTORY_CAPACITY, 10_000);
+    }
 
     #[test]
     fn context_ids_validate_known_and_namespaced_sources() {

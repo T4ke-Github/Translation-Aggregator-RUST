@@ -618,3 +618,123 @@ mod tests {
         );
     }
 }
+
+/// Action produced when submitting a provider request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueueAction<T> {
+    /// The request should be started immediately.
+    Start(T),
+    /// The request is now the sole pending request.
+    Queued,
+    /// The previous pending request was superseded and should be marked skipped.
+    Replaced(T),
+}
+/// Result classification for a provider request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RequestOutcome<T> {
+    /// The provider completed with a result.
+    Completed(T),
+    /// The request was superseded or cancelled without error.
+    Skipped,
+}
+/// One in-flight request and at most one latest-wins pending request.
+#[derive(Debug, Default)]
+pub struct ProviderQueue<T> {
+    in_flight: bool,
+    pending: Option<T>,
+}
+impl<T> ProviderQueue<T> {
+    /// Create an empty provider queue.
+    pub fn new() -> Self {
+        Self {
+            in_flight: false,
+            pending: None,
+        }
+    }
+    /// Submit a request, returning replaced pending work for skipped reporting.
+    pub fn submit(&mut self, request: T) -> QueueAction<T> {
+        if !self.in_flight {
+            self.in_flight = true;
+            QueueAction::Start(request)
+        } else if let Some(old) = self.pending.replace(request) {
+            QueueAction::Replaced(old)
+        } else {
+            QueueAction::Queued
+        }
+    }
+    /// Complete active work and promote pending work, if any.
+    pub fn complete(&mut self) -> Option<T> {
+        let next = self.pending.take();
+        self.in_flight = next.is_some();
+        next
+    }
+    /// Discard pending work and reset state; a later completion cannot start it.
+    pub fn reset(&mut self) -> Option<T> {
+        self.in_flight = false;
+        self.pending.take()
+    }
+}
+/// Fixed-capacity sliding-window limiter; timestamps must be nondecreasing.
+#[derive(Debug)]
+pub struct SlidingWindowRateLimiter {
+    limit: usize,
+    window: u64,
+    timestamps: std::collections::VecDeque<u64>,
+}
+impl SlidingWindowRateLimiter {
+    /// Create a limiter for at most `limit` admissions per `window` milliseconds.
+    pub fn new(limit: usize, window: u64) -> Self {
+        Self {
+            limit,
+            window,
+            timestamps: Default::default(),
+        }
+    }
+    /// Admit a request at monotonic millisecond timestamp `now` if capacity remains.
+    pub fn allow_at(&mut self, now: u64) -> bool {
+        while self
+            .timestamps
+            .front()
+            .is_some_and(|t| now >= *t && now - *t >= self.window)
+        {
+            self.timestamps.pop_front();
+        }
+        if self.limit == 0 || self.timestamps.len() >= self.limit {
+            return false;
+        }
+        self.timestamps.push_back(now);
+        true
+    }
+}
+
+#[cfg(test)]
+mod primitive_tests {
+    use super::*;
+    #[test]
+    fn queue_replaces_latest_and_completes_in_order() {
+        let mut q = ProviderQueue::new();
+        assert_eq!(q.submit(1), QueueAction::Start(1));
+        assert_eq!(q.submit(2), QueueAction::Queued);
+        assert_eq!(q.submit(3), QueueAction::Replaced(2));
+        assert_eq!(q.complete(), Some(3));
+        assert_eq!(q.complete(), None);
+    }
+    #[test]
+    fn reset_discards_pending_without_starting_it() {
+        let mut q = ProviderQueue::new();
+        q.submit(1);
+        q.submit(2);
+        assert_eq!(q.reset(), Some(2));
+        assert_eq!(q.complete(), None);
+        assert_eq!(q.submit(3), QueueAction::Start(3));
+    }
+    #[test]
+    fn rate_limit_expires_exactly_at_window_and_handles_regression() {
+        let mut l = SlidingWindowRateLimiter::new(2, 100);
+        assert!(l.allow_at(100));
+        assert!(l.allow_at(150));
+        assert!(!l.allow_at(199));
+        assert!(!l.allow_at(50));
+        assert!(l.allow_at(200));
+    }
+}
