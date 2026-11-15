@@ -2,6 +2,85 @@
 
 #![forbid(unsafe_code)]
 
+/// Error returned when sentence-aware splitting cannot honor the chunk limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SentenceSplitError {
+    /// Number of Unicode scalar values in the indivisible sentence.
+    pub actual_chars: usize,
+    /// Maximum number of scalar values permitted in each chunk.
+    pub max_chars: usize,
+}
+
+impl std::fmt::Display for SentenceSplitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "sentence has {} characters, limit {}",
+            self.actual_chars, self.max_chars
+        )
+    }
+}
+
+impl std::error::Error for SentenceSplitError {}
+
+/// Split text at sentence-ending punctuation or line breaks without changing its contents.
+/// Lengths count Unicode scalar values, not bytes or UTF-16 code units.
+pub fn split_sentences(text: &str, max_chars: usize) -> Result<Vec<String>, SentenceSplitError> {
+    if max_chars == 0 {
+        return Err(SentenceSplitError {
+            actual_chars: text.chars().count(),
+            max_chars,
+        });
+    }
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0;
+    let mut chunk_chars = 0;
+    let mut sentence_start = 0;
+    let mut sentence_chars = 0;
+
+    for (index, ch) in text.char_indices() {
+        sentence_chars += 1;
+        let sentence_end = index + ch.len_utf8();
+        let boundary = matches!(ch, '。' | '！' | '？' | '.' | '!' | '?' | '\n' | '\r');
+        if boundary {
+            if sentence_chars > max_chars {
+                return Err(SentenceSplitError {
+                    actual_chars: sentence_chars,
+                    max_chars,
+                });
+            }
+            if chunk_chars + sentence_chars > max_chars {
+                chunks.push(text[chunk_start..sentence_start].to_owned());
+                chunk_start = sentence_start;
+                chunk_chars = 0;
+            }
+            chunk_chars += sentence_chars;
+            sentence_start = sentence_end;
+            sentence_chars = 0;
+        }
+    }
+    if sentence_chars > 0 {
+        if sentence_chars > max_chars {
+            return Err(SentenceSplitError {
+                actual_chars: sentence_chars,
+                max_chars,
+            });
+        }
+        if chunk_chars + sentence_chars > max_chars {
+            chunks.push(text[chunk_start..sentence_start].to_owned());
+            chunk_start = sentence_start;
+        }
+    }
+    if chunk_start < text.len() {
+        chunks.push(text[chunk_start..].to_owned());
+    }
+    Ok(chunks)
+}
+
 /// Default maximum input length for automatic requests, in Unicode scalar values.
 pub const DEFAULT_AUTO_REQUEST_MAX_CHARS: usize = 500;
 
@@ -343,6 +422,61 @@ impl Default for ResultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_splitting_preserves_japanese_and_unicode_scalars() {
+        let input = "日本語。😀é!次";
+        let chunks = split_sentences(input, 6).unwrap();
+        assert_eq!(chunks, ["日本語。", "😀é!次"]);
+        assert_eq!(chunks.concat(), input);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 6));
+    }
+
+    #[test]
+    fn sentence_splitting_uses_line_breaks_and_keeps_whitespace() {
+        let input = "first line\n second\r\nthird";
+        let chunks = split_sentences(input, 11).unwrap();
+        assert_eq!(chunks.concat(), input);
+        assert_eq!(chunks, ["first line\n", " second\r\n", "third"]);
+    }
+
+    #[test]
+    fn sentence_splitting_rejects_indivisible_overlong_sentence_with_counts() {
+        assert_eq!(
+            split_sentences("😀abcd", 4),
+            Err(SentenceSplitError {
+                actual_chars: 5,
+                max_chars: 4
+            })
+        );
+    }
+
+    #[test]
+    fn sentence_splitting_accepts_exact_limit_and_rejects_zero_limit() {
+        assert_eq!(split_sentences("abc!", 4).unwrap(), ["abc!"]);
+        assert_eq!(
+            split_sentences("x", 0),
+            Err(SentenceSplitError {
+                actual_chars: 1,
+                max_chars: 0
+            })
+        );
+        assert_eq!(
+            split_sentences("", 0),
+            Err(SentenceSplitError {
+                actual_chars: 0,
+                max_chars: 0
+            })
+        );
+    }
+
+    #[test]
+    fn sentence_splitting_never_silently_trims_or_reorders() {
+        let input = "  one.\n\ttwo?  ";
+        let chunks = split_sentences(input, 7).unwrap();
+        assert_eq!(chunks.concat(), input);
+        assert_eq!(chunks, ["  one.\n", "\ttwo?  "]);
+    }
 
     fn key(
         provider: &str,

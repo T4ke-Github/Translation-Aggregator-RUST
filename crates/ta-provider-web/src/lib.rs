@@ -178,9 +178,78 @@ pub struct MappedRequest {
     pub body: Option<Value>,
 }
 impl ProviderDefinition {
+    /// Loads TOML provider definitions in filename order, keeping errors isolated per file.
+    pub fn load_folder(path: impl AsRef<std::path::Path>) -> FolderLoadReport {
+        let path = path.as_ref();
+        let mut report = FolderLoadReport::default();
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.errors.push(FolderLoadError {
+                    path: path.to_owned(),
+                    message: error.to_string(),
+                });
+                return report;
+            }
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) if entry.path().extension().is_some_and(|ext| ext == "toml") => {
+                    files.push(entry.path());
+                }
+                Ok(_) => {}
+                Err(error) => report.errors.push(FolderLoadError {
+                    path: path.to_owned(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        files.sort();
+        let mut ids = std::collections::BTreeMap::<String, std::path::PathBuf>::new();
+        for file in files {
+            let parsed = std::fs::read_to_string(&file)
+                .map_err(|e| e.to_string())
+                .and_then(|text| Self::from_toml(&text).map_err(|e| e.to_string()));
+            match parsed {
+                Ok(provider) => {
+                    let id = provider.definition().provider.id.clone();
+                    if let Some(first) = ids.get(&id) {
+                        report.errors.push(FolderLoadError {
+                            path: file,
+                            message: format!(
+                                "duplicate provider.id {id:?}; also defined in {}",
+                                first.display()
+                            ),
+                        });
+                    } else {
+                        ids.insert(id, file);
+                        report.providers.push(provider);
+                    }
+                }
+                Err(message) => report.errors.push(FolderLoadError {
+                    path: file,
+                    message,
+                }),
+            }
+        }
+        report
+    }
     /// Parses and validates a TOML provider definition.
     pub fn from_toml(s: &str) -> Result<ValidatedProvider, ProviderError> {
-        let d: Self = toml::from_str(s).map_err(|e| ProviderError::Parse(e.to_string()))?;
+        let d: Self = toml::from_str(s).map_err(|error: toml::de::Error| {
+            let position = error.span().map(|span| {
+                let before = &s[..span.start];
+                let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                format!("line {line}, column {column}: ")
+            });
+            ProviderError::Parse(format!(
+                "{}{}",
+                position.unwrap_or_default(),
+                error.message()
+            ))
+        })?;
         d.validate()
     }
     /// Checks configuration constraints and returns a validated provider.
@@ -234,6 +303,27 @@ impl ProviderDefinition {
             validate_json(&body.json)?;
         }
         Ok(ValidatedProvider(self))
+    }
+}
+/// Results from loading a directory of provider files.
+#[derive(Clone, Debug, Default)]
+pub struct FolderLoadReport {
+    /// Successfully loaded providers in filename order.
+    pub providers: Vec<ValidatedProvider>,
+    /// File-specific parse, validation, and duplicate-ID errors.
+    pub errors: Vec<FolderLoadError>,
+}
+/// An error associated with a provider file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderLoadError {
+    /// Path of the file that failed.
+    pub path: std::path::PathBuf,
+    /// Diagnostic message.
+    pub message: String,
+}
+impl fmt::Display for FolderLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.message)
     }
 }
 impl ValidatedProvider {
@@ -681,6 +771,46 @@ body.json = { q = "{{text}}", source = "{{src}}", target = "{{dst}}", api_key = 
 text = { jsonpath = "$.translatedText" }
 error = { jsonpath = "$.error" }
 "#;
+    #[test]
+    fn folder_loader_keeps_valid_files_and_reports_duplicates_and_parse_errors() {
+        use std::fs;
+        let folder = std::env::temp_dir().join(format!(
+            "ta-provider-folder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&folder).unwrap();
+        let valid = |id: &str| {
+            format!(
+                "[provider]\nid = '{id}'\nname = 'Local'\n[request]\nmethod = 'GET'\nurl = 'https://example.org'\n[response]\ntext = {{ jsonpath = '$.result' }}\n"
+            )
+        };
+        fs::write(folder.join("a.toml"), valid("first")).unwrap();
+        fs::write(folder.join("b.toml"), "[provider]\nid = [\n").unwrap();
+        fs::write(folder.join("c.toml"), valid("first")).unwrap();
+        fs::write(folder.join("d.toml"), valid("second")).unwrap();
+        fs::write(folder.join("ignored.txt"), valid("third")).unwrap();
+        let report = ProviderDefinition::load_folder(&folder);
+        assert_eq!(report.providers.len(), 2);
+        assert_eq!(report.providers[0].definition().provider.id, "first");
+        assert_eq!(report.providers[1].definition().provider.id, "second");
+        assert_eq!(report.errors.len(), 2);
+        assert_eq!(report.errors[0].path, folder.join("b.toml"));
+        assert!(
+            report.errors[0].to_string().contains("line 3, column"),
+            "{:?}",
+            report.errors
+        );
+        assert!(report.errors[0].to_string().contains("b.toml"));
+        assert_eq!(report.errors[1].path, folder.join("c.toml"));
+        assert!(report.errors[1].to_string().contains("a.toml"));
+        assert!(report.errors[1].to_string().contains("c.toml"));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
     fn serve_once(status: u16, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
