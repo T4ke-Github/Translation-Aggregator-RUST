@@ -127,6 +127,7 @@ mod win32 {
         // returned pointer is freed with CredFree below.
         let ok = unsafe { CredReadW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
         if ok == 0 {
+            // SAFETY: GetLastError has no preconditions.
             let code = unsafe { GetLastError() };
             if code == ERROR_NOT_FOUND {
                 return Ok(None);
@@ -139,6 +140,7 @@ mod win32 {
         // SAFETY: CredReadW returned this credential pointer; CredFree is the
         // matching allocator.
         let _guard = CredFreeGuard(credential);
+        // SAFETY: CredReadW returned a valid credential pointer.
         let bytes = unsafe { (*credential).CredentialBlobSize } as usize;
         if bytes == 0 {
             return Ok(None);
@@ -149,6 +151,7 @@ mod win32 {
                 "credential blob is too long",
             ));
         }
+        // SAFETY: CredReadW returned a valid credential pointer and size.
         let blob = unsafe { (*credential).CredentialBlob };
         if blob.is_null() {
             return Ok(None);
@@ -163,6 +166,7 @@ mod win32 {
         // SAFETY: target_name is NUL terminated and outlives the call.
         let ok = unsafe { CredDeleteW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0) };
         if ok == 0 {
+            // SAFETY: GetLastError has no preconditions.
             let code = unsafe { GetLastError() };
             if code == ERROR_NOT_FOUND {
                 return Ok(());
