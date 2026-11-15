@@ -356,6 +356,25 @@ impl Default for History {
     }
 }
 
+/// Deterministic in-memory history search criteria. Text matches original, processed,
+/// and provider result/error strings using Unicode lowercase (not full Unicode case folding).
+pub struct HistoryQuery<'a> {
+    /// Optional substring search; matching is case-insensitive for lowercase mappings.
+    pub search: Option<&'a str>,
+    /// Restrict to this validated context.
+    pub context: Option<&'a ContextId>,
+    /// Restrict to entries containing this provider result.
+    pub provider: Option<&'a ProviderId>,
+    /// Inclusive lower time bound.
+    pub from: Option<std::time::SystemTime>,
+    /// Inclusive upper time bound.
+    pub through: Option<std::time::SystemTime>,
+    /// Number of matching entries to skip after sorting.
+    pub offset: usize,
+    /// Maximum entries to return.
+    pub limit: usize,
+}
+
 impl History {
     /// Create a history with a configured maximum number of entries.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -375,6 +394,48 @@ impl History {
         }
         self.entries.push_back(entry);
         id
+    }
+    /// Search retained entries newest-first; entries with equal timestamps use ID order.
+    /// Search is substring-based across original/processed text and every provider outcome.
+    pub fn search(&self, query: &HistoryQuery<'_>) -> Vec<&HistoryEntry> {
+        let needle = query.search.map(str::to_lowercase);
+        let mut matches: Vec<&HistoryEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                if query
+                    .context
+                    .is_some_and(|context| &entry.context != context)
+                    || query
+                        .provider
+                        .is_some_and(|provider| !entry.providers.contains_key(provider))
+                    || query.from.is_some_and(|from| entry.time < from)
+                    || query.through.is_some_and(|through| entry.time > through)
+                {
+                    return false;
+                }
+                let Some(needle) = needle.as_deref() else {
+                    return true;
+                };
+                let text_matches = |text: &str| text.to_lowercase().contains(needle);
+                text_matches(&entry.original_text)
+                    || text_matches(&entry.processed_text)
+                    || entry
+                        .providers
+                        .values()
+                        .any(|result| match &result.outcome {
+                            ProviderOutcome::Result(text) | ProviderOutcome::Error(text) => {
+                                text_matches(text)
+                            }
+                        })
+            })
+            .collect();
+        matches.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.id.0.cmp(&a.id.0)));
+        matches
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect()
     }
     /// Find an entry by its typed ID.
     pub fn get(&self, id: &HistoryEntryId) -> Option<&HistoryEntry> {
@@ -462,6 +523,68 @@ mod tests {
             std::time::Duration::from_millis(23)
         );
         assert!(earlier.providers[&ProviderId::new("provider-a").unwrap()].cached);
+    }
+
+    #[test]
+    fn history_search_matches_original_processed_provider_and_filters_pages() {
+        let mut h = History::default();
+        let ctx = ContextId::new("api:game").unwrap();
+        let pid = ProviderId::new("web-a").unwrap();
+        let t = std::time::SystemTime::UNIX_EPOCH;
+        let mut a = HistoryEntry::new(HistoryEntryId::new(), t, ctx.clone(), "Fox", "trimmed");
+        a.providers.insert(
+            pid.clone(),
+            ProviderHistory {
+                outcome: ProviderOutcome::Result("Renard".into()),
+                status: ProviderStatus::Succeeded,
+                elapsed: std::time::Duration::ZERO,
+                cached: false,
+            },
+        );
+        h.push(a);
+        let mut b = HistoryEntry::new(
+            HistoryEntryId::new(),
+            t + std::time::Duration::from_secs(1),
+            ctx.clone(),
+            "other",
+            "fox processed",
+        );
+        b.providers.insert(
+            pid.clone(),
+            ProviderHistory {
+                outcome: ProviderOutcome::Error("FOX failed".into()),
+                status: ProviderStatus::Failed,
+                elapsed: std::time::Duration::ZERO,
+                cached: false,
+            },
+        );
+        h.push(b);
+        h.push(HistoryEntry::new(
+            HistoryEntryId::new(),
+            t + std::time::Duration::from_secs(2),
+            ContextId::new("typed").unwrap(),
+            "ignore",
+            "none",
+        ));
+        let q = HistoryQuery {
+            search: Some("fOx"),
+            context: Some(&ctx),
+            provider: Some(&pid),
+            from: None,
+            through: None,
+            offset: 0,
+            limit: 10,
+        };
+        let results = h.search(&q);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].original_text, "other");
+        let page = h.search(&HistoryQuery {
+            offset: 1,
+            limit: 1,
+            ..q
+        });
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].original_text, "Fox");
     }
 
     #[test]

@@ -1,6 +1,5 @@
-//! Basic declarative web translation provider schema and mapping (no HTTP client).
-//! Unsupported here: sessions, secret resolution, HTTP execution, retries, auth flows,
-//! response status handling, and advanced JSONPath/filter expressions.
+//! Declarative web translation provider schema, mapping, and HTTP transport.
+//! Unsupported here: sessions, secret resolution, retries, auth flows, and advanced JSONPath.
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -149,6 +148,14 @@ pub enum ProviderError {
     Template(String),
     /// The response did not contain a valid translation.
     Response(String),
+    /// HTTP transport failed.
+    Transport(String),
+    /// Request exceeded its configured timeout.
+    Timeout,
+    /// Server returned a non-success status; the body is intentionally omitted.
+    HttpStatus(u16),
+    /// Response exceeded the maximum permitted size.
+    ResponseTooLarge,
 }
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -234,6 +241,78 @@ impl ValidatedProvider {
     pub fn definition(&self) -> &ProviderDefinition {
         &self.0
     }
+    /// Sends a mapped request with the provider timeout and an 8 MiB response limit.
+    pub fn send(&self, request: &MappedRequest) -> Result<Vec<u8>, ProviderError> {
+        use std::io::Read;
+        const MAX: u64 = 8 * 1024 * 1024;
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(std::time::Duration::from_secs(
+                self.0.provider.timeout_seconds.max(1),
+            ))
+            .build();
+        let mut outgoing = agent.request(&request.method, &request.url);
+        for (name, value) in &request.query {
+            outgoing = outgoing.query(name, value);
+        }
+        for (name, value) in &request.headers {
+            outgoing = outgoing.set(name, value);
+        }
+        let result = if let Some(body) = &request.body {
+            let content_type = self
+                .0
+                .request
+                .body
+                .as_ref()
+                .map(|b| b.content_type.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("application/json");
+            outgoing
+                .set("Content-Type", content_type)
+                .send_string(&body.to_string())
+        } else {
+            outgoing.call()
+        };
+        let response = match result {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => return Err(ProviderError::HttpStatus(code)),
+            Err(ureq::Error::Transport(e)) => {
+                let mut cause = std::error::Error::source(&e);
+                while let Some(error) = cause {
+                    if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        matches!(
+                            io.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        )
+                    }) {
+                        return Err(ProviderError::Timeout);
+                    }
+                    cause = error.source();
+                }
+                return Err(ProviderError::Transport(e.kind().to_string()));
+            }
+        };
+        if !(200..300).contains(&response.status()) {
+            return Err(ProviderError::HttpStatus(response.status()));
+        }
+        if response
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > MAX)
+        {
+            return Err(ProviderError::ResponseTooLarge);
+        }
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(MAX + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| ProviderError::Transport(e.kind().to_string()))?;
+        if bytes.len() as u64 > MAX {
+            return Err(ProviderError::ResponseTooLarge);
+        }
+        Ok(bytes)
+    }
     /// Applies placeholders to construct a request.
     pub fn map_request(
         &self,
@@ -291,12 +370,7 @@ impl ValidatedProvider {
                 .query
                 .iter()
                 .filter(|(_, v)| !omit_source || v.as_str() != "{{src}}")
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        substitute(v, text, source, target, Context::Query),
-                    )
-                })
+                .map(|(k, v)| (k.clone(), substitute(v, text, source, target, Context::Raw)))
                 .collect(),
             headers: r
                 .headers
@@ -439,7 +513,6 @@ fn decode_html_entities(s: &str) -> String {
 enum Context {
     Raw,
     Url,
-    Query,
 }
 fn substitute(s: &str, text: &str, src: &str, dst: &str, ctx: Context) -> String {
     let mut out = String::new();
@@ -458,7 +531,7 @@ fn substitute(s: &str, text: &str, src: &str, dst: &str, ctx: Context) -> String
             if let Some(val) = val {
                 out.push_str(&match ctx {
                     Context::Raw => val.to_owned(),
-                    Context::Url | Context::Query => percent_encode(val),
+                    Context::Url => percent_encode(val),
                 });
                 i += end + 4;
                 continue;
@@ -612,6 +685,96 @@ body.json = { q = "{{text}}", source = "{{src}}", target = "{{dst}}", api_key = 
 text = { jsonpath = "$.translatedText" }
 error = { jsonpath = "$.error" }
 "#;
+    fn serve_once(status: u16, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/translate", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut received = Vec::new();
+            let mut bytes = [0u8; 4096];
+            loop {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0, "client closed before request headers");
+                received.extend_from_slice(&bytes[..count]);
+                if received.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = received
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&received[..header_end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while received.len() - header_end < length {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0, "client closed before request body");
+                received.extend_from_slice(&bytes[..count]);
+            }
+            let reply = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8(received).unwrap()
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn transport_sends_mapped_query_and_headers_once() {
+        let (url, server) = serve_once(200, r#"{"translatedText":"done"}"#);
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}?old=1'\nquery={{ 'term&'='{{{{text}}}}' }}\nheaders={{ 'X-Test'='yes' }}\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("a & b", "ja", "en").unwrap();
+        let bytes = provider.send(&request).unwrap();
+        assert_eq!(
+            provider.extract_translation_from_bytes(&bytes).unwrap(),
+            "done"
+        );
+        let received = server.join().unwrap();
+        assert!(
+            received.starts_with("GET /translate?old=1&term%26=a+%26+b HTTP/1.1"),
+            "{received}"
+        );
+        assert!(received.to_ascii_lowercase().contains("x-test: yes"));
+    }
+
+    #[test]
+    fn transport_posts_json_and_hides_non_success_body() {
+        let (url, server) = serve_once(403, "do not expose this body");
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='POST'\nurl='{url}'\nbody.json={{ q='{{{{text}}}}' }}\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("こんにちは", "ja", "en").unwrap();
+        let error = provider.send(&request).unwrap_err();
+        assert!(matches!(error, ProviderError::HttpStatus(403)));
+        assert!(!error.to_string().contains("do not expose this body"));
+        let received = server.join().unwrap();
+        assert!(received.starts_with("POST /translate HTTP/1.1"));
+        assert!(
+            received
+                .to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
+        assert!(received.contains("こんにちは"));
+    }
+
     #[test]
     fn exact_documented_schema_parses_and_maps_json_body() {
         let d: ProviderDefinition = toml::from_str(LIBRE).unwrap();
@@ -710,7 +873,7 @@ error = { jsonpath = "$.error" }
         let p = ProviderDefinition::from_toml(s).unwrap();
         let m = p.map_request("{{dst}} &", "en", "fr").unwrap();
         assert_eq!(m.url, "https://example.test/%7B%7Bdst%7D%7D%20%26");
-        assert_eq!(m.query["q"], "%7B%7Bdst%7D%7D%20%26");
+        assert_eq!(m.query["q"], "{{dst}} &");
         assert_eq!(m.query["lang"], "en-fr");
     }
     #[test]
