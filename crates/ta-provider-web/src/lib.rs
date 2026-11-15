@@ -126,7 +126,14 @@ pub struct Response {
 /// A supported, restricted JSONPath selector.
 pub struct Selector {
     /// Path to the selected response value.
+    #[serde(default)]
     pub jsonpath: String,
+    /// Regex for HTML or text responses; group 1 is extracted.
+    #[serde(default)]
+    pub regex: Option<String>,
+    /// Separator used when the selector yields multiple values.
+    #[serde(default)]
+    pub join: Option<String>,
 }
 #[derive(Clone, Debug)]
 /// A provider definition that passed schema validation.
@@ -189,12 +196,27 @@ impl ProviderDefinition {
             ));
         }
         let path = self.response.text.jsonpath.as_str();
-        if path.is_empty() {
+        if self.response.text.regex.is_none() && path.is_empty() {
             return Err(ProviderError::Invalid(
-                "response.text.jsonpath is required".into(),
+                "response.text.jsonpath or regex is required".into(),
             ));
         }
-        segments(path)?;
+        if !path.is_empty() {
+            segments(path)?;
+        }
+        if let Some(pattern) = &self.response.text.regex {
+            regex::Regex::new(pattern)
+                .map_err(|e| ProviderError::Invalid(format!("invalid response regex: {e}")))?;
+        }
+        if let Some(error) = &self.response.error {
+            if !error.jsonpath.is_empty() {
+                segments(&error.jsonpath)?;
+            }
+            if let Some(pattern) = &error.regex {
+                regex::Regex::new(pattern)
+                    .map_err(|e| ProviderError::Invalid(format!("invalid error regex: {e}")))?;
+            }
+        }
         for s in std::iter::once(self.request.url.as_str())
             .chain(self.request.query.values().map(String::as_str))
             .chain(self.request.headers.values().map(String::as_str))
@@ -289,7 +311,83 @@ impl ValidatedProvider {
             .map(str::to_owned)
             .ok_or_else(|| ProviderError::Response("selected value is not a string".into()))
     }
+
+    /// Checks configured provider errors before extracting translation text from raw bytes.
+    pub fn extract_translation_from_bytes(&self, bytes: &[u8]) -> Result<String, ProviderError> {
+        let raw = String::from_utf8_lossy(bytes);
+        let selector = &self.0.response.text;
+        if let Some(error_selector) = &self.0.response.error
+            && let Some(pattern) = &error_selector.regex
+        {
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| ProviderError::Invalid(format!("invalid error regex: {e}")))?;
+            if let Some(message) = re.captures(&raw).and_then(|c| c.get(1)) {
+                return Err(ProviderError::Response(format!(
+                    "{}: {}",
+                    self.0.provider.name,
+                    message.as_str()
+                )));
+            }
+        }
+        let mut result = if let Some(pattern) = &selector.regex {
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| ProviderError::Invalid(format!("invalid response regex: {e}")))?;
+            let matches = re
+                .captures_iter(&raw)
+                .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned()))
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(ProviderError::Response(
+                    "translation not found in reply".into(),
+                ));
+            }
+            match &selector.join {
+                Some(separator) => matches.join(separator),
+                None => matches.into_iter().next().expect("matches is nonempty"),
+            }
+        } else {
+            let json: Value = serde_json::from_str(&raw)
+                .map_err(|_| ProviderError::Response("Reply was not JSON".into()))?;
+            if let Some(error_selector) = &self.0.response.error
+                && !error_selector.jsonpath.is_empty()
+                && let Ok(error) = select_json(&json, &error_selector.jsonpath)
+            {
+                let message = error.as_str().unwrap_or("");
+                if !message.is_empty() {
+                    return Err(ProviderError::Response(format!(
+                        "{}: {message}",
+                        self.0.provider.name
+                    )));
+                }
+            }
+            self.extract_translation(&json)?
+        };
+        if self.0.response.html_decode {
+            result = decode_html_entities(&result);
+        }
+        Ok(result)
+    }
 }
+fn select_json<'a>(response: &'a Value, path: &str) -> Result<&'a Value, ProviderError> {
+    let mut value = response;
+    for segment in segments(path)? {
+        value = match segment {
+            Segment::Key(key) => value.get(key),
+            Segment::Index(index) => value.get(index),
+        }
+        .ok_or_else(|| ProviderError::Response(format!("path {path} did not match")))?;
+    }
+    Ok(value)
+}
+
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
 #[derive(Clone, Copy)]
 enum Context {
     Raw,
@@ -536,6 +634,44 @@ error = { jsonpath = "$.error" }
             p.extract_translation(&serde_json::json!({"items":[{"text":"ok"}]}))
                 .unwrap(),
             "ok"
+        );
+    }
+
+    #[test]
+    fn provider_error_takes_precedence_over_translation() {
+        let source = LIBRE.replace(", api_key = \"{{secret.libre-key}}\"", "");
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let error =
+            provider.extract_translation_from_bytes(br#"{"error":"quota","translatedText":"ok"}"#);
+        assert!(
+            matches!(error, Err(ProviderError::Response(message)) if message.contains("quota"))
+        );
+    }
+
+    #[test]
+    fn regex_error_takes_precedence_and_default_returns_first_match() {
+        let source = "[provider]\nid='test'\nname='Test'\n[request]\nmethod='GET'\nurl='https://example.test'\n[response]\ntext={regex='<span>(.*?)</span>'}\nerror={regex='Error: ([^<]+)'}";
+        let provider = ProviderDefinition::from_toml(source).unwrap();
+        assert_eq!(
+            provider
+                .extract_translation_from_bytes(b"<span>A</span><span>B</span>")
+                .unwrap(),
+            "A"
+        );
+        let error = provider.extract_translation_from_bytes(b"Error: blocked<span>A</span>");
+        assert!(
+            matches!(error, Err(ProviderError::Response(message)) if message.contains("blocked"))
+        );
+    }
+
+    #[test]
+    fn response_extraction_supports_regex_join_and_html_entities() {
+        let s = "[provider]\nid='test'\nname='Test'\n[request]\nmethod='GET'\nurl='https://example.test'\n[response]\nhtml_decode=true\ntext={regex='<span>(.*?)</span>', join=' | '}";
+        let p = ProviderDefinition::from_toml(s).unwrap();
+        assert_eq!(
+            p.extract_translation_from_bytes(b"<span>A &amp; B</span><span>&quot;C&quot;</span>")
+                .unwrap(),
+            "A & B | \"C\""
         );
     }
 }

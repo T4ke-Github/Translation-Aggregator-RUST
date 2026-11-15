@@ -254,9 +254,168 @@ pub const fn default_auto_request_max_chars() -> usize {
     DEFAULT_AUTO_REQUEST_MAX_CHARS
 }
 
+/// Maximum number of successful translation results retained in memory.
+pub const DEFAULT_RESULT_CACHE_CAPACITY: usize = 10_000;
+
+/// Identity of a translated request, including caller-provided settings fingerprint.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ResultCacheKey {
+    /// Stable provider identifier.
+    pub provider_id: String,
+    /// Text after request preprocessing.
+    pub processed_text: String,
+    /// Requested source language.
+    pub source: String,
+    /// Requested target language.
+    pub target: String,
+    /// Fingerprint covering all settings that affect provider output.
+    pub settings_fingerprint: String,
+}
+
+/// Bounded in-memory least-recently-used store for complete successful outputs.
+#[derive(Debug)]
+pub struct ResultCache {
+    capacity: usize,
+    entries: Vec<(ResultCacheKey, String)>,
+}
+
+impl ResultCache {
+    /// Create an empty cache with the default maximum size.
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_RESULT_CACHE_CAPACITY)
+    }
+
+    /// Create an empty cache with a chosen maximum number of entries.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Find a result and mark it most recently used, unless this provider forbids caching.
+    pub fn get(&mut self, key: &ResultCacheKey, cache_allowed: bool) -> Option<&str> {
+        if !cache_allowed {
+            return None;
+        }
+        let index = self.entries.iter().position(|(entry, _)| entry == key)?;
+        let item = self.entries.remove(index);
+        self.entries.push(item);
+        self.entries.last().map(|(_, value)| value.as_str())
+    }
+
+    /// Store a complete successful result; opting-out providers are never retained.
+    /// Call only after a request has completed successfully (never for partial output).
+    pub fn insert_success(&mut self, key: ResultCacheKey, output: String, cache_allowed: bool) {
+        if !cache_allowed || self.capacity == 0 {
+            return;
+        }
+        self.entries.retain(|(existing, _)| existing != &key);
+        if self.entries.len() == self.capacity {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, output));
+    }
+
+    /// Bypass lookup for a retry, then replace the prior result on success.
+    pub fn retry_success(&mut self, key: ResultCacheKey, output: String, cache_allowed: bool) {
+        self.entries.retain(|(existing, _)| existing != &key);
+        self.insert_success(key, output, cache_allowed);
+    }
+
+    /// Number of retained results.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache has no retained results.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for ResultCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(
+        provider: &str,
+        text: &str,
+        source: &str,
+        target: &str,
+        settings: &str,
+    ) -> ResultCacheKey {
+        ResultCacheKey {
+            provider_id: provider.into(),
+            processed_text: text.into(),
+            source: source.into(),
+            target: target.into(),
+            settings_fingerprint: settings.into(),
+        }
+    }
+
+    #[test]
+    fn result_cache_keys_cover_provider_text_languages_and_settings() {
+        let mut cache = ResultCache::new();
+        let original = key("p", "processed", "ja", "en", "model-a");
+        cache.insert_success(original.clone(), "result".into(), true);
+        for other in [
+            key("q", "processed", "ja", "en", "model-a"),
+            key("p", "other", "ja", "en", "model-a"),
+            key("p", "processed", "fr", "en", "model-a"),
+            key("p", "processed", "ja", "fr", "model-a"),
+            key("p", "processed", "ja", "en", "model-b"),
+        ] {
+            assert_eq!(cache.get(&other, true), None);
+        }
+        assert_eq!(cache.get(&original, true), Some("result"));
+        assert_eq!(cache.get(&original, false), None);
+        assert_eq!(cache.get(&original, true), Some("result"));
+    }
+
+    #[test]
+    fn result_cache_enforces_provider_opt_out_and_zero_capacity() {
+        let mut cache = ResultCache::with_capacity(1);
+        cache.insert_success(key("p", "x", "ja", "en", "s"), "no".into(), false);
+        assert_eq!(cache.len(), 0);
+        let mut none = ResultCache::with_capacity(0);
+        none.insert_success(key("p", "x", "ja", "en", "s"), "no".into(), true);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn result_cache_evicts_true_lru_entry_and_retry_replaces() {
+        let mut cache = ResultCache::with_capacity(2);
+        let a = key("p", "a", "ja", "en", "s");
+        let b = key("p", "b", "ja", "en", "s");
+        let c = key("p", "c", "ja", "en", "s");
+        cache.insert_success(a.clone(), "A1".into(), true);
+        cache.insert_success(b.clone(), "B".into(), true);
+        assert_eq!(cache.get(&a, true), Some("A1"));
+        cache.insert_success(c.clone(), "C".into(), true);
+        assert_eq!(cache.get(&b, true), None);
+        assert_eq!(cache.get(&a, true), Some("A1"));
+        cache.retry_success(a.clone(), "A2".into(), true);
+        assert_eq!(cache.get(&a, true), Some("A2"));
+        cache.retry_success(a.clone(), "ignored".into(), false);
+        assert_eq!(cache.get(&a, true), None);
+        assert_eq!(cache.get(&c, true), Some("C"));
+    }
+
+    #[test]
+    fn unsuccessful_or_partial_outputs_are_not_cached_by_policy() {
+        let mut cache = ResultCache::new();
+        let key = key("p", "x", "ja", "en", "s");
+        // Failed and partial requests do not invoke insert_success.
+        assert_eq!(cache.get(&key, true), None);
+        assert_eq!(cache.len(), 0);
+    }
 
     #[test]
     fn defaults_only_local_tools_to_automatic_translation() {
