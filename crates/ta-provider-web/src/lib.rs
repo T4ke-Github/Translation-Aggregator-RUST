@@ -175,10 +175,47 @@ pub enum ProviderError {
 }
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            Self::HttpStatus(code) => write!(f, "HTTP {code} {}", status_reason(*code)),
+            _ => write!(f, "{:?}", self),
+        }
     }
 }
 impl std::error::Error for ProviderError {}
+struct HttpResponse {
+    status: reqwest::StatusCode,
+    charset: Option<String>,
+    body: Vec<u8>,
+}
+
+fn status_reason(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "HTTP Error",
+    }
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key.trim().eq_ignore_ascii_case("charset"))
+            .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+    })
+}
+
+fn decode_response_body(bytes: &[u8], charset: Option<&str>) -> String {
+    charset
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .map(|encoding| encoding.decode(bytes).0.into_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
 #[derive(Clone, PartialEq)]
 /// Request data after applying translation placeholders.
 pub struct MappedRequest {
@@ -432,7 +469,85 @@ impl fmt::Display for FolderLoadError {
         write!(f, "{}: {}", self.path.display(), self.message)
     }
 }
+fn query_has_credential(request: &MappedRequest) -> bool {
+    let sensitive_name = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        ["key", "token", "secret", "pass", "auth", "credential"]
+            .iter()
+            .any(|term| name.contains(term))
+    };
+    request.query.keys().any(|name| sensitive_name(name))
+        || reqwest::Url::parse(&request.url).is_ok_and(|url| {
+            !url.username().is_empty()
+                || url.password().is_some()
+                || url.query_pairs().any(|(name, _)| sensitive_name(&name))
+        })
+}
+
 impl ValidatedProvider {
+    fn configured_error(
+        &self,
+        body: &str,
+        request: &MappedRequest,
+    ) -> Result<Option<String>, ProviderError> {
+        let Some(selector) = &self.0.response.error else {
+            return Ok(None);
+        };
+        let regex_message = if let Some(pattern) = &selector.regex {
+            let re = regex::Regex::new(pattern)
+                .map_err(|_| ProviderError::Invalid("invalid error regex".into()))?;
+            re.captures(body)
+                .and_then(|captures| captures.get(1))
+                .map(|value| value.as_str().to_owned())
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
+        let json_message = if regex_message.is_none() && !selector.jsonpath.is_empty() {
+            serde_json::from_str::<Value>(body).ok().and_then(|json| {
+                select_json_many(&json, &selector.jsonpath)
+                    .ok()?
+                    .into_iter()
+                    .find_map(|value| match value {
+                        Value::String(text) if !text.is_empty() => Some(text.clone()),
+                        Value::Number(number) => Some(number.to_string()),
+                        Value::Bool(true) => Some("true".into()),
+                        _ => None,
+                    })
+            })
+        } else {
+            None
+        };
+        let Some(message) = regex_message.or(json_message) else {
+            return Ok(None);
+        };
+        let template = &self.0.request;
+        let has_secret = query_has_credential(request)
+            || template.url.contains("{{secret.")
+            || template
+                .query
+                .values()
+                .any(|value| value.contains("{{secret."))
+            || template
+                .headers
+                .values()
+                .any(|value| value.contains("{{secret."))
+            || template
+                .body
+                .as_ref()
+                .is_some_and(|body| body.json.to_string().contains("{{secret."))
+            || !literal_credential_warnings(
+                &template.headers,
+                template.body.as_ref().map(|body| &body.json),
+            )
+            .is_empty();
+        let message = if has_secret {
+            "service error"
+        } else {
+            &message
+        };
+        Ok(Some(format!("{}: {message}", self.0.provider.name)))
+    }
     /// Translate manual text by splitting it into sentence-aware provider-sized requests.
     /// All chunks are validated and mapped before `transport` is invoked.
     pub fn send_manual_with<F>(
@@ -474,6 +589,19 @@ impl ValidatedProvider {
         self.send_manual_with(text, source, target, |request| self.send(request))
     }
 
+    /// Sends and processes a response, checking configured service errors before status and text.
+    pub fn send_translation(&self, request: &MappedRequest) -> Result<String, ProviderError> {
+        let response = self.send_response(request, true)?;
+        let text = decode_response_body(&response.body, response.charset.as_deref());
+        if let Some(error) = self.configured_error(&text, request)? {
+            return Err(ProviderError::Response(error));
+        }
+        if !response.status.is_success() {
+            return Err(ProviderError::HttpStatus(response.status.as_u16()));
+        }
+        self.extract_translation_from_bytes(text.as_bytes())
+    }
+
     /// Returns the validated provider definition.
     pub fn definition(&self) -> &ProviderDefinition {
         &self.0
@@ -484,6 +612,18 @@ impl ValidatedProvider {
     }
     /// Sends a mapped request with the provider timeout and an 8 MiB response limit.
     pub fn send(&self, request: &MappedRequest) -> Result<Vec<u8>, ProviderError> {
+        let response = self.send_response(request, false)?;
+        if !response.status.is_success() {
+            return Err(ProviderError::HttpStatus(response.status.as_u16()));
+        }
+        Ok(response.body)
+    }
+
+    fn send_response(
+        &self,
+        request: &MappedRequest,
+        inspect_service_error: bool,
+    ) -> Result<HttpResponse, ProviderError> {
         use std::io::Read;
         const MAX: u64 = 8 * 1024 * 1024;
         let client = reqwest::blocking::Client::builder()
@@ -492,12 +632,12 @@ impl ValidatedProvider {
                 self.0.provider.timeout_seconds.max(1),
             ))
             .build()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|_| ProviderError::Transport("HTTP client setup failed".into()))?;
         let mut outgoing = client.request(
             request
                 .method
                 .parse::<reqwest::Method>()
-                .map_err(|e| ProviderError::Transport(e.to_string()))?,
+                .map_err(|_| ProviderError::Transport("invalid HTTP method".into()))?,
             &request.url,
         );
         for (name, value) in &request.query {
@@ -519,17 +659,22 @@ impl ValidatedProvider {
                 .header(reqwest::header::CONTENT_TYPE, content_type)
                 .json(body);
         }
-        let mut response = outgoing.send().map_err(|e| {
-            if e.is_timeout() {
+        let mut response = outgoing.send().map_err(|error| {
+            if error.is_timeout() {
                 ProviderError::Timeout
             } else {
-                ProviderError::Transport(e.to_string())
+                ProviderError::Transport("HTTP request failed".into())
             }
         })?;
         let status = response.status();
-        if !status.is_success() {
+        if !status.is_success() && (!inspect_service_error || self.0.response.error.is_none()) {
             return Err(ProviderError::HttpStatus(status.as_u16()));
         }
+        let charset = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(charset_from_content_type);
         if response
             .headers()
             .get(reqwest::header::CONTENT_LENGTH)
@@ -537,18 +682,36 @@ impl ValidatedProvider {
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|n| n > MAX)
         {
-            return Err(ProviderError::ResponseTooLarge);
+            return Err(if status.is_success() {
+                ProviderError::ResponseTooLarge
+            } else {
+                ProviderError::HttpStatus(status.as_u16())
+            });
         }
         let mut bytes = Vec::new();
         response
             .by_ref()
             .take(MAX + 1)
             .read_to_end(&mut bytes)
-            .map_err(|e| ProviderError::Transport(e.kind().to_string()))?;
+            .map_err(|e| {
+                if status.is_success() {
+                    ProviderError::Transport(e.kind().to_string())
+                } else {
+                    ProviderError::HttpStatus(status.as_u16())
+                }
+            })?;
         if bytes.len() as u64 > MAX {
-            return Err(ProviderError::ResponseTooLarge);
+            return Err(if status.is_success() {
+                ProviderError::ResponseTooLarge
+            } else {
+                ProviderError::HttpStatus(status.as_u16())
+            });
         }
-        Ok(bytes)
+        Ok(HttpResponse {
+            status,
+            charset,
+            body: bytes,
+        })
     }
     /// Applies placeholders to construct a request.
     pub fn map_request(
@@ -1541,6 +1704,14 @@ error = { jsonpath = "$.error" }
     }
 
     fn serve_once(status: u16, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        serve_raw_once(status, body.as_bytes(), "")
+    }
+
+    fn serve_raw_once(
+        status: u16,
+        body: &'static [u8],
+        content_type: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/translate", listener.local_addr().unwrap());
@@ -1579,10 +1750,11 @@ error = { jsonpath = "$.error" }
                 received.extend_from_slice(&bytes[..count]);
             }
             let reply = format!(
-                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n{content_type}Connection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(reply.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
             String::from_utf8(received).unwrap()
         });
         (url, handle)
@@ -1630,6 +1802,150 @@ error = { jsonpath = "$.error" }
     }
 
     #[test]
+    fn literal_query_key_is_hidden_from_service_errors() {
+        let (url, server) = serve_once(403, r#"{"error":"invalid API key KEY123"}"#);
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\nquery={{api_key='KEY123'}}\n[response]\ntext={{jsonpath='$.translatedText'}}\nerror={{jsonpath='$.error'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        let error = provider.send_translation(&request).unwrap_err();
+        assert!(error.to_string().contains("service error"));
+        assert!(!error.to_string().contains("KEY123"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_reports_http_status_before_reading_an_oversized_error_body() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/translate", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let amount = stream.read(&mut request).unwrap();
+            assert!(amount > 0);
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9437184\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        assert_eq!(
+            provider.send(&request).unwrap_err(),
+            ProviderError::HttpStatus(403)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_service_error_precedes_http_status_without_exposing_body() {
+        let (url, server) = serve_once(
+            403,
+            r#"{"error":"quota exceeded","translatedText":"ignored"}"#,
+        );
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\n[response]\ntext={{jsonpath='$.translatedText'}}\nerror={{jsonpath='$.error'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        assert!(matches!(
+            provider.send_translation(&request),
+            Err(ProviderError::Response(message)) if message.contains("Local: quota exceeded") && !message.contains("ignored")
+        ));
+        server.join().unwrap();
+
+        let (url, server) = serve_once(403, "SECRET_BODY");
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        let error = provider.send_translation(&request).unwrap_err();
+        assert_eq!(error.to_string(), "HTTP 403 Forbidden");
+        assert!(!error.to_string().contains("SECRET_BODY"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_error_does_not_echo_a_secret_from_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\ntimeout_seconds=1\n[request]\nmethod='GET'\nurl='http://127.0.0.1:{port}/{{{{secret.api-key}}}}'\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let secrets = std::collections::BTreeMap::from([("api-key".into(), "KEY123".into())]);
+        let request = provider
+            .map_request_with_values("hello", "en", "fr", &Default::default(), &secrets)
+            .unwrap();
+        let error = provider.send_translation(&request).unwrap_err();
+        assert!(!error.to_string().contains("KEY123"));
+    }
+
+    #[test]
+    fn service_error_does_not_repeat_a_request_secret() {
+        let (url, server) =
+            serve_once(403, r#"{"error":"echo KEY123","translatedText":"ignored"}"#);
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\nheaders={{Authorization='Bearer {{{{secret.api-key}}}}'}}\n[response]\ntext={{jsonpath='$.translatedText'}}\nerror={{jsonpath='$.error'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let secrets =
+            std::collections::BTreeMap::from([("api-key".to_owned(), "KEY123".to_owned())]);
+        let request = provider
+            .map_request_with_values("hello", "en", "fr", &Default::default(), &secrets)
+            .unwrap();
+        let error = provider.send_translation(&request).unwrap_err();
+        assert!(error.to_string().contains("Local: service error"));
+        assert!(!error.to_string().contains("KEY123"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_decodes_declared_charset_and_replaces_invalid_utf8() {
+        let (url, server) = serve_raw_once(
+            200,
+            b"{\"translatedText\":\"caf\xe9\"}",
+            "Content-Type: application/json; charset=iso-8859-1\r\n",
+        );
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        assert_eq!(provider.send_translation(&request).unwrap(), "café");
+        server.join().unwrap();
+
+        let (url, server) = serve_raw_once(200, b"{\"translatedText\":\"bad\xff\"}", "");
+        let source = source.replace(&request.url, &url);
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        assert_eq!(provider.send_translation(&request).unwrap(), "bad�");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_reports_malformed_json_without_reply_text() {
+        let (url, server) = serve_once(200, "<html>login page</html>");
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("hello", "en", "fr").unwrap();
+        let error = provider.send_translation(&request).unwrap_err();
+        assert!(error.to_string().contains("Reply was not JSON"));
+        assert!(!error.to_string().contains("login page"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn transport_posts_json_and_hides_non_success_body() {
         let (url, server) = serve_once(403, "do not expose this body");
         let source = format!(
@@ -1648,6 +1964,16 @@ error = { jsonpath = "$.error" }
                 .contains("content-type: application/json")
         );
         assert!(received.contains("こんにちは"));
+    }
+
+    #[test]
+    fn response_charset_and_invalid_utf8_are_lossy_and_default_to_utf8() {
+        assert_eq!(decode_response_body(b"caf\xe9", Some("ISO-8859-1")), "café");
+        assert_eq!(decode_response_body(b"a\xffb", None), "a\u{fffd}b");
+        assert_eq!(
+            charset_from_content_type("text/plain; charset=latin1").as_deref(),
+            Some("latin1")
+        );
     }
 
     #[test]
