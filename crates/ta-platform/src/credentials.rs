@@ -158,7 +158,10 @@ mod win32 {
         }
         // SAFETY: CredentialBlob and CredentialBlobSize describe this blob.
         let slice = unsafe { std::slice::from_raw_parts(blob, bytes) };
-        Ok(Some(String::from_utf8_lossy(slice).into_owned()))
+        let secret = std::str::from_utf8(slice).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "credential blob is not UTF-8")
+        })?;
+        Ok(Some(secret.to_owned()))
     }
 
     pub(super) fn delete(target: &str) -> io::Result<()> {
@@ -192,7 +195,7 @@ mod win32 {
 fn save_secret_win32(target: &str, secret: &[u8]) -> io::Result<()> {
     use std::ptr;
     use windows_sys::Win32::Security::Credentials::{
-        CRED_PERSIST_ENTERPRISE, CRED_TYPE_GENERIC, CREDENTIALW,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW,
     };
 
     let mut target_name = target
@@ -213,7 +216,7 @@ fn save_secret_win32(target: &str, secret: &[u8]) -> io::Result<()> {
         LastWritten: FILETIME_ZERO,
         CredentialBlobSize: secret.len() as u32,
         CredentialBlob: secret.as_ptr().cast_mut(),
-        Persist: CRED_PERSIST_ENTERPRISE,
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
         AttributeCount: 0,
         Attributes: ptr::null_mut(),
         TargetAlias: ptr::null_mut(),
@@ -277,6 +280,33 @@ mod tests {
                 assert!(!error.to_string().contains(name));
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_credential_store_roundtrip_is_per_user() {
+        use super::{delete_secret, read_secret, save_secret};
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = delete_secret(&self.0);
+            }
+        }
+        let name = format!(
+            "ci-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let _cleanup = Cleanup(name.clone());
+        assert_eq!(read_secret(&name).unwrap(), None);
+        let secret = "test-only-\u{79d8}\u{5bc6}";
+        save_secret(&name, secret).unwrap();
+        assert_eq!(read_secret(&name).unwrap().as_deref(), Some(secret));
+        delete_secret(&name).unwrap();
+        assert_eq!(read_secret(&name).unwrap(), None);
     }
 
     #[test]
