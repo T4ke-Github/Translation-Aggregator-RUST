@@ -36,9 +36,25 @@ pub struct Provider {
     /// Whether the provider is enabled.
     pub enabled: bool,
     #[serde(default)]
-    /// Maximum text length per request, if supplied.
-    pub max_chars: Option<usize>,
+    /// Whether to display the unofficial-service warning.
+    pub unofficial: bool,
+    #[serde(default)]
+    /// Whether incoming text is translated automatically.
+    pub auto_translate: bool,
+    #[serde(default = "default_max_chars")]
+    /// Maximum text length per request.
+    pub max_chars: usize,
+    #[serde(default = "default_timeout_seconds")]
+    /// Request timeout in seconds.
+    pub timeout_seconds: u64,
 }
+fn default_max_chars() -> usize {
+    1000
+}
+fn default_timeout_seconds() -> u64 {
+    15
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// Language support configuration.
@@ -96,6 +112,9 @@ impl Default for Body {
 #[serde(deny_unknown_fields)]
 /// Response extraction configuration.
 pub struct Response {
+    #[serde(default)]
+    /// Whether extracted text should be HTML-decoded.
+    pub html_decode: bool,
     /// Selector for the translated text.
     pub text: Selector,
     #[serde(default)]
@@ -152,6 +171,12 @@ impl ProviderDefinition {
     }
     /// Checks configuration constraints and returns a validated provider.
     pub fn validate(self) -> Result<ValidatedProvider, ProviderError> {
+        if self.provider.id.trim().is_empty() {
+            return Err(ProviderError::Invalid("provider.id is required".into()));
+        }
+        if self.provider.name.trim().is_empty() {
+            return Err(ProviderError::Invalid("provider.name is required".into()));
+        }
         if self.request.url.trim().is_empty() {
             return Err(ProviderError::Invalid("request.url is required".into()));
         }
@@ -188,9 +213,44 @@ impl ValidatedProvider {
         &self.0
     }
     /// Applies placeholders to construct a request.
-    pub fn map_request(&self, text: &str, source: &str, target: &str) -> MappedRequest {
+    pub fn map_request(
+        &self,
+        text: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<MappedRequest, ProviderError> {
+        if text.chars().count() > self.0.provider.max_chars {
+            return Err(ProviderError::Invalid(format!(
+                "text exceeds max_chars ({})",
+                self.0.provider.max_chars
+            )));
+        }
+        let allowed = &self.0.languages.only;
+        if !allowed.is_empty()
+            && ((!allowed.iter().any(|v| v == source) && source != "auto")
+                || !allowed.iter().any(|v| v == target))
+        {
+            return Err(ProviderError::Invalid(
+                "unsupported source or target language".into(),
+            ));
+        }
         let r = &self.0.request;
-        MappedRequest {
+        let languages = &self.0.languages;
+        let source = if source == "auto" {
+            languages.auto.as_deref().unwrap_or(source)
+        } else {
+            languages
+                .map
+                .get(source)
+                .map(String::as_str)
+                .unwrap_or(source)
+        };
+        let target = languages
+            .map
+            .get(target)
+            .map(String::as_str)
+            .unwrap_or(target);
+        Ok(MappedRequest {
             method: r.method.clone(),
             url: substitute(&r.url, text, source, target, Context::Url),
             query: r
@@ -212,7 +272,7 @@ impl ValidatedProvider {
                 .body
                 .as_ref()
                 .map(|b| map_json(&b.json, text, source, target)),
-        }
+        })
     }
     /// Extracts a translation string from a JSON response.
     pub fn extract_translation(&self, response: &Value) -> Result<String, ProviderError> {
@@ -385,7 +445,7 @@ error = { jsonpath = "$.error" }
         assert_eq!(d.provider.id, "my-libretranslate");
         assert_eq!(d.provider.name, "LibreTranslate (my server)");
         assert!(d.provider.enabled);
-        assert_eq!(d.provider.max_chars, Some(5000));
+        assert_eq!(d.provider.max_chars, 5000);
         assert_eq!(d.request.method, "POST");
         assert_eq!(d.request.url, "https://translate.example.org/translate");
         let body = d.request.body.as_ref().unwrap();
@@ -397,6 +457,49 @@ error = { jsonpath = "$.error" }
         assert_eq!(d.response.error.unwrap().jsonpath, "$.error");
     }
     #[test]
+    fn guide_optional_provider_fields_have_defaults() {
+        let d = ProviderDefinition::from_toml(
+            &LIBRE
+                .replace("enabled = true\nmax_chars = 5000\n", "")
+                .replace(", api_key = \"{{secret.libre-key}}\"", ""),
+        )
+        .unwrap();
+        assert!(!d.definition().provider.enabled);
+        assert!(!d.definition().provider.unofficial);
+        assert!(!d.definition().provider.auto_translate);
+        assert_eq!(d.definition().provider.max_chars, 1000);
+        assert_eq!(d.definition().provider.timeout_seconds, 15);
+        assert!(!d.definition().response.html_decode);
+    }
+    #[test]
+    fn missing_provider_identity_is_rejected() {
+        for bad in [
+            LIBRE.replace("id = \"my-libretranslate\"\n", ""),
+            LIBRE.replace("name = \"LibreTranslate (my server)\"\n", ""),
+        ] {
+            assert!(matches!(
+                ProviderDefinition::from_toml(&bad),
+                Err(ProviderError::Parse(_))
+            ));
+        }
+    }
+    #[test]
+    fn language_mapping_and_auto_source_apply_to_placeholders() {
+        let s = LIBRE.replace("enabled = true\nmax_chars = 5000\n", "")
+            .replace("[request]", "[languages]\nauto = \"detect\"\nmap = { \"zh-Hans\" = \"zh-CN\" }\nonly = [\"en\", \"zh-Hans\"]\n\n[request]")
+            .replace("{{secret.libre-key}}", "key");
+        let p = ProviderDefinition::from_toml(&s).unwrap();
+        let mapped = p.map_request("hello", "auto", "zh-Hans").unwrap();
+        let body = mapped.body.unwrap();
+        assert_eq!(body["source"], "detect");
+        assert_eq!(body["target"], "zh-CN");
+        assert!(p.map_request("hello", "en", "fr").is_err());
+        assert!(
+            p.map_request("x".repeat(5001).as_str(), "en", "zh-Hans")
+                .is_err()
+        );
+    }
+    #[test]
     fn secret_placeholder_fails_closed() {
         assert!(matches!(
             ProviderDefinition::from_toml(LIBRE),
@@ -405,9 +508,9 @@ error = { jsonpath = "$.error" }
     }
     #[test]
     fn query_mapping_encodes_and_is_single_pass() {
-        let s = "[request]\nmethod='POST'\nurl='https://example.test/{{text}}'\n[request.query]\nq='{{text}}'\nlang='{{src}}-{{dst}}'\n[response]\ntext={jsonpath='$.text'}";
+        let s = "[provider]\nid='test'\nname='Test'\n[request]\nmethod='POST'\nurl='https://example.test/{{text}}'\n[request.query]\nq='{{text}}'\nlang='{{src}}-{{dst}}'\n[response]\ntext={jsonpath='$.text'}";
         let p = ProviderDefinition::from_toml(s).unwrap();
-        let m = p.map_request("{{dst}} &", "en", "fr");
+        let m = p.map_request("{{dst}} &", "en", "fr").unwrap();
         assert_eq!(m.url, "https://example.test/%7B%7Bdst%7D%7D%20%26");
         assert_eq!(m.query["q"], "%7B%7Bdst%7D%7D%20%26");
         assert_eq!(m.query["lang"], "en-fr");

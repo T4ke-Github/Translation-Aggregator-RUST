@@ -9,6 +9,117 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const APP_DIR: &str = "Translation Aggregator";
+
+/// Parsed settings text, retaining the original bytes for lossless edits.
+#[derive(Debug, Clone)]
+pub struct SettingsDocument {
+    source: String,
+    version: u64,
+    writable: bool,
+    warnings: Vec<String>,
+}
+
+impl SettingsDocument {
+    /// Parse and validate a settings TOML document without normalizing its formatting.
+    pub fn parse(source: &str) -> Result<Self, String> {
+        let value: toml::Value =
+            toml::from_str(source).map_err(|e: toml::de::Error| e.to_string())?;
+        let mut warnings = Vec::new();
+        let version = match value.get("schema_version") {
+            None => {
+                warnings.push("schema_version missing; assumed v1".to_owned());
+                1
+            }
+            Some(v) => v
+                .as_integer()
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| "schema_version must be a positive integer".to_owned())?,
+        };
+        let writable = version <= 1;
+        if !writable {
+            warnings.push(format!(
+                "settings schema v{version} is newer; file is read-only"
+            ));
+        }
+        Ok(Self {
+            source: source.to_owned(),
+            version,
+            writable,
+            warnings,
+        })
+    }
+
+    /// Return the parsed settings schema version.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    /// Whether this version is safe for the current app to edit.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+    /// Return non-fatal diagnostics found while parsing.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+}
+
+impl std::fmt::Display for SettingsDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.source)
+    }
+}
+
+/// Loaded settings and whether the backup was used.
+#[derive(Debug, Clone)]
+pub struct LoadedSettings {
+    /// The parsed settings document.
+    pub document: SettingsDocument,
+    /// Whether the primary file failed to parse and a backup supplied the data.
+    pub recovered_from_backup: bool,
+}
+
+/// Load settings, falling back to a valid `.bak` without altering either file.
+pub fn load_settings(path: &Path) -> io::Result<LoadedSettings> {
+    let primary = fs::read_to_string(path);
+    match primary {
+        Ok(text) => match SettingsDocument::parse(&text) {
+            Ok(document) => Ok(LoadedSettings {
+                document,
+                recovered_from_backup: false,
+            }),
+            Err(primary_error) => load_backup(path, primary_error),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(LoadedSettings {
+            document: SettingsDocument::parse("").expect("empty TOML is valid"),
+            recovered_from_backup: false,
+        }),
+        Err(e) => load_backup(path, e),
+    }
+}
+
+fn load_backup(path: &Path, primary_error: impl std::fmt::Display) -> io::Result<LoadedSettings> {
+    let backup = path.with_file_name(format!(
+        "{}.bak",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let text = fs::read_to_string(&backup).map_err(|backup_error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("settings invalid ({primary_error}); backup unavailable: {backup_error}"),
+        )
+    })?;
+    let document = SettingsDocument::parse(&text).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("settings invalid ({primary_error}); backup invalid: {e}"),
+        )
+    })?;
+    Ok(LoadedSettings {
+        document,
+        recovered_from_backup: true,
+    })
+}
 const SETTINGS_FILE: &str = "settings.toml";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -154,6 +265,57 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ta-platform-{stamp}"));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn versioned_document_preserves_unknown_values_and_unchanged_formatting() {
+        let source = "# keep me\n[future]
+answer = 42 # comment\n";
+        let parsed = SettingsDocument::parse(source).unwrap();
+        assert_eq!(parsed.version(), 1);
+        assert_eq!(parsed.to_string(), source);
+        assert!(parsed.is_writable());
+    }
+
+    #[test]
+    fn missing_version_is_v1_with_warning_and_newer_is_read_only() {
+        let legacy = SettingsDocument::parse("value = 3\n").unwrap();
+        assert_eq!(legacy.version(), 1);
+        assert!(legacy.warnings().iter().any(|w| w.contains("assumed v1")));
+        let newer = SettingsDocument::parse("schema_version = 99\n").unwrap();
+        assert!(!newer.is_writable());
+    }
+
+    #[test]
+    fn invalid_schema_versions_are_rejected() {
+        for source in [
+            "schema_version = 0\n",
+            "schema_version = -1\n",
+            "schema_version = \"v1\"\n",
+        ] {
+            assert!(SettingsDocument::parse(source).is_err());
+        }
+    }
+
+    #[test]
+    fn absent_settings_start_with_empty_v1_document() {
+        let dir = temp_dir();
+        let loaded = load_settings(&dir.join("settings.toml")).unwrap();
+        assert_eq!(loaded.document.version(), 1);
+        assert!(!loaded.recovered_from_backup);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_primary_recovers_backup_without_overwriting_corrupt_file() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        fs::write(&path, "invalid = [\n").unwrap();
+        fs::write(dir.join("settings.toml.bak"), "schema_version = 1\n").unwrap();
+        let recovered = load_settings(&path).unwrap();
+        assert!(recovered.recovered_from_backup);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "invalid = [\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
