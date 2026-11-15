@@ -189,6 +189,8 @@ version = "0.0.0"
 dependencies = [
  "ta-core",
  "ta-platform",
+ "ta-substitute",
+ "ta-text",
 ]
 
 [[package]]

@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 ta-core.workspace = true
 ta-platform.workspace = true
+ta-text.workspace = true
+ta-substitute.workspace = true
 
 [lints]
 workspace = true

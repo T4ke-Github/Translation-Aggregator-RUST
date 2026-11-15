@@ -7,6 +7,175 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use ta_core::{ContextId, History, HistoryEntry, HistoryEntryId, TextInput};
+use ta_substitute::SubstitutionEngine;
+use ta_text::{CharacterRepeatMode, NewlineMode};
+
+/// Pipeline-level switches for duplicate and repeat cleanup.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelineOptions {
+    /// Accept only inputs containing Japanese script.
+    pub japanese_only: bool,
+    /// Suppress the same text repeated in one context.
+    pub suppress_repeats: bool,
+    /// Bypass automatic duplicate suppression for a user action.
+    pub manual: bool,
+    /// Suppress repeated cycles of input entries.
+    pub detect_loops: bool,
+    /// Character-repeat cleanup mode.
+    pub repeat_mode: CharacterRepeatMode,
+    /// Line-break cleanup mode.
+    pub newline_mode: NewlineMode,
+}
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            japanese_only: false,
+            suppress_repeats: false,
+            manual: false,
+            detect_loops: false,
+            repeat_mode: CharacterRepeatMode::None,
+            newline_mode: NewlineMode::Keep,
+        }
+    }
+}
+
+/// Reason an input did not proceed to translation routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SkipReason {
+    /// Cleanup produced empty text.
+    EmptyAfterNormalization,
+    /// A per-context filter rejected the input.
+    Filtered,
+    /// The input repeated a detected cycle.
+    LoopDetected,
+    /// Substitutions or transforms removed all text.
+    EmptyAfterSubstitutions,
+}
+
+/// Result of preparing an input for routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedInput {
+    /// Prepared text and its history entry.
+    Ready(PreparedText),
+    /// Input rejected before routing.
+    Skipped(SkipReason),
+}
+
+/// Text prepared for all eligible translators.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedText {
+    /// ID of the stored history entry.
+    pub history_id: HistoryEntryId,
+    /// Validated source identity.
+    pub context: ContextId,
+    /// Original accepted input.
+    pub original_text: String,
+    /// Final text after cleanup and substitutions.
+    pub processed_text: String,
+    /// Non-fatal transform failures.
+    pub warnings: Vec<String>,
+}
+
+/// Hooks run before and after substitution, in that order.
+pub struct PipelineTransforms<P, Q> {
+    /// Transform applied before substitution.
+    pub pre_substitution: P,
+    /// Transform applied after substitution.
+    pub post_substitution: Q,
+}
+
+/// Run deterministic text stages only; transform failures warn and preserve input.
+pub fn prepare_input<P, Q>(
+    input: TextInput,
+    context: ContextId,
+    filter: &mut TextFilter,
+    substitutions: &SubstitutionEngine,
+    history: &mut History,
+    options: PipelineOptions,
+    transforms: PipelineTransforms<P, Q>,
+) -> PreparedInput
+where
+    P: FnOnce(&str) -> Result<String, String>,
+    Q: FnOnce(&str) -> Result<String, String>,
+{
+    let PipelineTransforms {
+        pre_substitution,
+        post_substitution,
+    } = transforms;
+    let original = input.as_str().to_owned();
+    let Some(accepted) = filter.accept(
+        context.as_str(),
+        &original,
+        options.japanese_only,
+        options.suppress_repeats,
+        options.manual,
+    ) else {
+        return PreparedInput::Skipped(SkipReason::Filtered);
+    };
+    if filter
+        .accept_with_loop_detection(context.as_str(), &accepted, options.detect_loops)
+        .is_none()
+    {
+        return PreparedInput::Skipped(SkipReason::LoopDetected);
+    }
+    let mut text = ta_text::normalize_repeats(&accepted, options.repeat_mode);
+    text = ta_text::normalize_newlines(&text, options.newline_mode);
+    if text.trim().is_empty() {
+        return PreparedInput::Skipped(SkipReason::EmptyAfterNormalization);
+    }
+    let mut warnings = Vec::new();
+    text = match pre_substitution(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!("pre-substitution transform skipped: {error}"));
+            text
+        }
+    };
+    text = substitutions.apply(&text, context.as_str());
+    if text.trim().is_empty() {
+        history.push(HistoryEntry::new(
+            HistoryEntryId::new(),
+            std::time::SystemTime::now(),
+            context,
+            original,
+            text,
+        ));
+        return PreparedInput::Skipped(SkipReason::EmptyAfterSubstitutions);
+    }
+    text = match post_substitution(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!("post-substitution transform skipped: {error}"));
+            text
+        }
+    };
+    if text.trim().is_empty() {
+        history.push(HistoryEntry::new(
+            HistoryEntryId::new(),
+            std::time::SystemTime::now(),
+            context,
+            original,
+            text,
+        ));
+        return PreparedInput::Skipped(SkipReason::EmptyAfterSubstitutions);
+    }
+    let id = HistoryEntryId::new();
+    history.push(HistoryEntry::new(
+        id,
+        std::time::SystemTime::now(),
+        context.clone(),
+        original.clone(),
+        text.clone(),
+    ));
+    PreparedInput::Ready(PreparedText {
+        history_id: id,
+        context,
+        original_text: original,
+        processed_text: text,
+        warnings,
+    })
+}
 
 /// Pure text acceptance state; callers invoke this after a flush.
 #[derive(Default)]
@@ -214,6 +383,103 @@ mod tests {
         assert_eq!(
             f.accept_with_loop_detection("x", "A", true),
             Some("A".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn marker_transforms_bracket_substitutions_and_history_precedes_routing() {
+        let context = ta_core::ContextId::new("typed").unwrap();
+        let input = ta_core::TextInput::new("hello").unwrap();
+        let engine =
+            ta_substitute::SubstitutionEngine::new(
+                true,
+                vec![ta_substitute::SubstitutionProfile::new("*").with_rules([
+                    ta_substitute::SubstitutionRule::try_new("hello", "sub").unwrap(),
+                ])],
+            );
+        let mut filter = TextFilter::new();
+        let mut history = ta_core::History::default();
+        let result = prepare_input(
+            input,
+            context,
+            &mut filter,
+            &engine,
+            &mut history,
+            PipelineOptions::default(),
+            PipelineTransforms {
+                pre_substitution: |text: &str| Ok(format!("pre[{text}]")),
+                post_substitution: |text: &str| Ok(format!("post[{text}]")),
+            },
+        );
+        let PreparedInput::Ready(prepared) = result else {
+            panic!("expected ready")
+        };
+        assert_eq!(prepared.original_text, "hello");
+        assert_eq!(prepared.processed_text, "post[pre[sub]]");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history.get(&prepared.history_id).unwrap().processed_text,
+            prepared.processed_text
+        );
+    }
+
+    #[test]
+    fn empty_substitution_skips_and_plugin_failure_warns_and_passes_through() {
+        let context = ta_core::ContextId::new("typed").unwrap();
+        let input = ta_core::TextInput::new("hello").unwrap();
+        let engine = ta_substitute::SubstitutionEngine::new(
+            true,
+            vec![
+                ta_substitute::SubstitutionProfile::new("*")
+                    .with_rules([ta_substitute::SubstitutionRule::try_new("hello", "").unwrap()]),
+            ],
+        );
+        let mut filter = TextFilter::new();
+        let mut history = ta_core::History::default();
+        assert!(matches!(
+            prepare_input(
+                input,
+                context,
+                &mut filter,
+                &engine,
+                &mut history,
+                PipelineOptions::default(),
+                PipelineTransforms {
+                    pre_substitution: |s: &str| Ok(s.to_owned()),
+                    post_substitution: |s: &str| Ok(s.to_owned()),
+                },
+            ),
+            PreparedInput::Skipped(SkipReason::EmptyAfterSubstitutions)
+        ));
+        assert_eq!(history.len(), 1);
+
+        let context = ta_core::ContextId::new("typed").unwrap();
+        let input = ta_core::TextInput::new("hello").unwrap();
+        let engine = ta_substitute::SubstitutionEngine::new(false, vec![]);
+        let result = prepare_input(
+            input,
+            context,
+            &mut filter,
+            &engine,
+            &mut history,
+            PipelineOptions::default(),
+            PipelineTransforms {
+                pre_substitution: |_: &str| Err("plugin broke".into()),
+                post_substitution: |s: &str| Ok(s.to_owned()),
+            },
+        );
+        let PreparedInput::Ready(prepared) = result else {
+            panic!("expected ready")
+        };
+        assert_eq!(prepared.processed_text, "hello");
+        assert_eq!(
+            prepared.warnings,
+            ["pre-substitution transform skipped: plugin broke"]
         );
     }
 }

@@ -318,18 +318,21 @@ impl ValidatedProvider {
     }
     /// Extracts a translation string from a JSON response.
     pub fn extract_translation(&self, response: &Value) -> Result<String, ProviderError> {
-        let path = &self.0.response.text.jsonpath;
-        let mut v = response;
-        for seg in segments(path)? {
-            v = match seg {
-                Segment::Key(k) => v.get(k),
-                Segment::Index(i) => v.get(i),
-            }
-            .ok_or_else(|| ProviderError::Response(format!("path {path} did not match")))?;
+        let selector = &self.0.response.text;
+        let matches = select_json_many(response, &selector.jsonpath)?;
+        let strings = matches
+            .into_iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| ProviderError::Response("selected value is not a string".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match &selector.join {
+            Some(separator) => Ok(strings.join(separator)),
+            None if strings.len() == 1 => Ok(strings.into_iter().next().expect("one match")),
+            None => Ok(strings.into_iter().next().expect("matches are nonempty")),
         }
-        v.as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| ProviderError::Response("selected value is not a string".into()))
     }
 
     /// Checks configured provider errors before extracting translation text from raw bytes.
@@ -388,12 +391,36 @@ impl ValidatedProvider {
         Ok(result)
     }
 }
+fn select_json_many<'a>(response: &'a Value, path: &str) -> Result<Vec<&'a Value>, ProviderError> {
+    let mut current = vec![response];
+    for segment in segments(path)? {
+        current = current
+            .into_iter()
+            .flat_map(|value| match &segment {
+                Segment::Key(key) => value.get(key).into_iter().collect::<Vec<_>>(),
+                Segment::Index(index) => value.get(*index).into_iter().collect::<Vec<_>>(),
+                Segment::Wildcard => value
+                    .as_array()
+                    .map(|a| a.iter().collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        if current.is_empty() {
+            return Err(ProviderError::Response(format!(
+                "path {path} did not match"
+            )));
+        }
+    }
+    Ok(current)
+}
+
 fn select_json<'a>(response: &'a Value, path: &str) -> Result<&'a Value, ProviderError> {
     let mut value = response;
     for segment in segments(path)? {
         value = match segment {
             Segment::Key(key) => value.get(key),
             Segment::Index(index) => value.get(index),
+            Segment::Wildcard => None,
         }
         .ok_or_else(|| ProviderError::Response(format!("path {path} did not match")))?;
     }
@@ -514,6 +541,7 @@ fn validate_json(v: &Value) -> Result<(), ProviderError> {
 enum Segment {
     Key(String),
     Index(usize),
+    Wildcard,
 }
 fn segments(p: &str) -> Result<Vec<Segment>, ProviderError> {
     if !p.starts_with('$') {
@@ -548,9 +576,16 @@ fn segments(p: &str) -> Result<Vec<Segment>, ProviderError> {
                 }
                 i += 1;
                 out.push(Segment::Index(n));
+            } else if i < b.len() && b[i] == b'*' {
+                i += 1;
+                if i >= b.len() || b[i] != b']' {
+                    return Err(ProviderError::Invalid("invalid JSONPath wildcard".into()));
+                }
+                i += 1;
+                out.push(Segment::Wildcard);
             } else {
                 return Err(ProviderError::Invalid(
-                    "only numeric JSONPath indices are supported".into(),
+                    "only numeric indices and [*] are supported".into(),
                 ));
             }
         } else {
@@ -700,6 +735,41 @@ error = { jsonpath = "$.error" }
                 .unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn jsonpath_wildcard_joins_string_matches_and_missing_path_errors() {
+        let source = LIBRE
+            .replace(", api_key = \"{{secret.libre-key}}\"", "")
+            .replace("$.translatedText", "$.items[*].text")
+            .replace(
+                "text = { jsonpath = \"$.items[*].text\" }",
+                "text = { jsonpath = \"$.items[*].text\", join = \" | \" }",
+            );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        assert_eq!(
+            provider
+                .extract_translation(&serde_json::json!({"items":[{"text":"A"},{"text":"B"}]}))
+                .unwrap(),
+            "A | B"
+        );
+        assert!(matches!(
+            provider.extract_translation(&serde_json::json!({"items":[]})),
+            Err(ProviderError::Response(_))
+        ));
+    }
+
+    #[test]
+    fn jsonpath_wildcard_rejects_non_string_match() {
+        let source = LIBRE
+            .replace(", api_key = \"{{secret.libre-key}}\"", "")
+            .replace("$.translatedText", "$.items[*].text");
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        assert!(matches!(
+            provider
+                .extract_translation(&serde_json::json!({"items":[{"text":"A"},{"text":null}]})),
+            Err(ProviderError::Response(_))
+        ));
     }
 
     #[test]
