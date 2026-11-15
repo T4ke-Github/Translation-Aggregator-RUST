@@ -22,8 +22,24 @@ pub struct SettingsDocument {
 impl SettingsDocument {
     /// Parse and validate a settings TOML document without normalizing its formatting.
     pub fn parse(source: &str) -> Result<Self, String> {
-        let value: toml::Value =
-            toml::from_str(source).map_err(|e: toml::de::Error| e.to_string())?;
+        let value: toml::Value = toml::from_str(source).map_err(|e: toml::de::Error| {
+            let (line, column) = e
+                .span()
+                .map(|span| {
+                    source[..span.start.min(source.len())].chars().fold(
+                        (1, 1),
+                        |(line, column), ch| {
+                            if ch == '\n' {
+                                (line + 1, 1)
+                            } else {
+                                (line, column + 1)
+                            }
+                        },
+                    )
+                })
+                .unwrap_or((1, 1));
+            format!("invalid TOML at line {line}, column {column}")
+        })?;
         let mut warnings = Vec::new();
         let version = match value.get("schema_version") {
             None => {
@@ -332,7 +348,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("ta-platform-{stamp}"));
+        let id = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("ta-platform-{}-{stamp}-{id}", std::process::id()));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -365,6 +383,32 @@ answer = 42 # comment\n";
         ] {
             assert!(SettingsDocument::parse(source).is_err());
         }
+    }
+
+    #[test]
+    fn malformed_toml_diagnostic_has_location_without_source_text() {
+        let marker = "private_marker_7f31";
+        let source = format!("ok = 1\nsecret = [{marker}\n");
+        let error = SettingsDocument::parse(&source).unwrap_err();
+        assert!(error.contains("line 2"), "{error}");
+        assert!(error.contains("column"), "{error}");
+        assert!(!error.contains(marker), "{error}");
+    }
+
+    #[test]
+    fn corrupt_settings_warning_has_path_location_and_no_source_text() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        let marker = "private_marker_7f31";
+        fs::write(&path, format!("ok = 1\nsecret = [{marker}\n")).unwrap();
+        let loaded = load_settings(&path).unwrap();
+        let warning = loaded.document.warnings().join(" ");
+        assert!(warning.contains(path.to_str().unwrap()), "{warning}");
+        assert!(warning.contains("line 2"), "{warning}");
+        assert!(warning.contains("column"), "{warning}");
+        assert!(warning.contains("using defaults"), "{warning}");
+        assert!(!warning.contains(marker), "{warning}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

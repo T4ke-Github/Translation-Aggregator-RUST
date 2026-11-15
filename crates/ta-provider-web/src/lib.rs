@@ -293,6 +293,34 @@ impl ProviderDefinition {
             .try_into()
             .map_err(|_| ProviderError::Parse("invalid provider definition".into()))?;
         let mut validated = d.validate()?;
+        let literal_warnings = literal_credential_warnings(
+            &validated.0.request.headers,
+            validated.0.request.body.as_ref().map(|body| &body.json),
+        );
+        let secret_in_request = !literal_warnings.is_empty()
+            || validated.0.request.url.contains("{{secret.")
+            || validated
+                .0
+                .request
+                .query
+                .values()
+                .any(|value| value.contains("{{secret."))
+            || validated
+                .0
+                .request
+                .headers
+                .values()
+                .any(|value| value.contains("{{secret."))
+            || validated
+                .0
+                .request
+                .body
+                .as_ref()
+                .is_some_and(|body| body.json.to_string().contains("{{secret."));
+        if requires_insecure_http_confirmation(&validated.0.request.url, secret_in_request) {
+            warnings.push("HTTP with a secret requires explicit user confirmation".into());
+        }
+        warnings.extend(literal_warnings);
         validated.1 = warnings;
         Ok(validated)
     }
@@ -842,9 +870,165 @@ fn segments(p: &str) -> Result<Vec<Segment>, ProviderError> {
     }
     Ok(out)
 }
+/// Returns a warning for literal credential-like header/body values, without exposing them.
+pub fn literal_credential_warnings(
+    headers: &BTreeMap<String, String>,
+    body: Option<&Value>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if !value.contains("{{")
+            && !value.trim().is_empty()
+            && (lower == "authorization" || lower.contains("key") || lower.contains("token"))
+        {
+            warnings.push(format!(
+                "header {name}: This looks like a key stored in the file; move it to Secrets"
+            ));
+        }
+    }
+    fn visit(value: &Value, path: &str, warnings: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let field = key.to_ascii_lowercase();
+                    let here = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if matches!(field.as_str(), "api_key" | "key" | "auth_key") && value.is_string()
+                    {
+                        let text = value.as_str().unwrap_or_default();
+                        if !text.trim().is_empty() && !text.contains("{{") {
+                            warnings.push(format!("body {here}: This looks like a key stored in the file; move it to Secrets"));
+                        }
+                    }
+                    visit(value, &here, warnings);
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    visit(item, &format!("{path}[{i}]"), warnings);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(body) = body {
+        visit(body, "", &mut warnings);
+    }
+    warnings
+}
+
+/// Replaces secret occurrences (longest first) with a name-bearing mask.
+pub fn redact_secrets(text: &str, names_and_values: &[(String, String)]) -> String {
+    let mut secrets: Vec<_> = names_and_values
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    secrets.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if let Some((name, value)) = secrets
+            .iter()
+            .find(|(_, value)| remaining.starts_with(value.as_str()))
+        {
+            output.push_str(&format!("••••{name}"));
+            remaining = &remaining[value.len()..];
+        } else {
+            let ch = remaining.chars().next().expect("nonempty remainder");
+            output.push(ch);
+            remaining = &remaining[ch.len_utf8()..];
+        }
+    }
+    output
+}
+
+/// Whether an HTTP URL containing a secret requires user confirmation.
+pub fn requires_insecure_http_confirmation(url: &str, contains_secret: bool) -> bool {
+    if !contains_secret {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => false,
+        Some(host) => !host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_parse_exposes_safe_literal_key_and_http_warnings() {
+        let source = "[provider]\nid='safe'\nname='Safe'\n[request]\nmethod='POST'\nurl='http://example.org'\nheaders={Authorization='Bearer PLACEHOLDER'}\nbody.json={api_key='PLACEHOLDER', q='{{text}}'}\n[response]\ntext={jsonpath='$.translatedText'}\n";
+        let provider = ProviderDefinition::from_toml(source).unwrap();
+        let warnings = provider.warnings().join("\n");
+        assert!(warnings.contains("header Authorization"));
+        assert!(warnings.contains("body api_key"));
+        assert!(!warnings.contains("PLACEHOLDER"));
+        assert!(requires_insecure_http_confirmation(
+            "HTTP://example.org",
+            true
+        ));
+        assert!(!requires_insecure_http_confirmation(
+            "http://127.2.3.4",
+            true
+        ));
+        assert!(warnings.contains("requires explicit user confirmation"));
+    }
+
+    #[test]
+    fn security_helpers() {
+        assert!(
+            literal_credential_warnings(
+                &BTreeMap::new(),
+                Some(&serde_json::json!({"nested":{"api_key":"secret"}}))
+            )
+            .iter()
+            .all(|w| !w.contains("secret"))
+        );
+        assert_eq!(
+            redact_secrets(
+                "x secret secretish secret",
+                &[
+                    ("k".into(), "secret".into()),
+                    ("long".into(), "secretish".into())
+                ]
+            ),
+            "x ••••k ••••long ••••k"
+        );
+        assert_eq!(
+            redact_secrets("unchanged", &[("k".into(), String::new())]),
+            "unchanged"
+        );
+        assert!(!requires_insecure_http_confirmation(
+            "http://127.0.0.1/x",
+            true
+        ));
+        assert!(!requires_insecure_http_confirmation(
+            "https://example.com",
+            true
+        ));
+        assert!(requires_insecure_http_confirmation(
+            "http://example.com",
+            true
+        ));
+    }
     const LIBRE: &str = r#"[provider]
 id = "my-libretranslate"
 name = "LibreTranslate (my server)"
