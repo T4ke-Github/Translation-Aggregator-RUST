@@ -258,6 +258,7 @@ impl ValidatedProvider {
         }
         let r = &self.0.request;
         let languages = &self.0.languages;
+        let omit_source = source == "auto" && languages.auto.as_deref() == Some("");
         let source = if source == "auto" {
             languages.auto.as_deref().unwrap_or(source)
         } else {
@@ -272,12 +273,24 @@ impl ValidatedProvider {
             .get(target)
             .map(String::as_str)
             .unwrap_or(target);
+        if omit_source
+            && (r.url.contains("{{src}}")
+                || r.headers.values().any(|v| v.contains("{{src}}"))
+                || r.query
+                    .values()
+                    .any(|v| v != "{{src}}" && v.contains("{{src}}")))
+        {
+            return Err(ProviderError::Template(
+                "auto source cannot be omitted from a mixed template".into(),
+            ));
+        }
         Ok(MappedRequest {
             method: r.method.clone(),
             url: substitute(&r.url, text, source, target, Context::Url),
             query: r
                 .query
                 .iter()
+                .filter(|(_, v)| !omit_source || v.as_str() != "{{src}}")
                 .map(|(k, v)| {
                     (
                         k.clone(),
@@ -293,7 +306,14 @@ impl ValidatedProvider {
             body: r
                 .body
                 .as_ref()
-                .map(|b| map_json(&b.json, text, source, target)),
+                .map(|b| {
+                    if omit_source {
+                        map_json_without_source(&b.json, text, target)
+                    } else {
+                        Ok(map_json(&b.json, text, source, target))
+                    }
+                })
+                .transpose()?,
         })
     }
     /// Extracts a translation string from a JSON response.
@@ -463,6 +483,26 @@ fn map_json(v: &Value, t: &str, s: &str, d: &str) -> Value {
         _ => v.clone(),
     }
 }
+fn map_json_without_source(v: &Value, text: &str, target: &str) -> Result<Value, ProviderError> {
+    match v {
+        Value::Object(values) => values
+            .iter()
+            .filter(|(_, value)| value.as_str() != Some("{{src}}"))
+            .map(|(key, value)| Ok((key.clone(), map_json_without_source(value, text, target)?)))
+            .collect::<Result<serde_json::Map<String, Value>, ProviderError>>()
+            .map(Value::Object),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| map_json_without_source(value, text, target))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::String(s) if s.contains("{{src}}") => Err(ProviderError::Template(
+            "auto source cannot be omitted from a mixed template".into(),
+        )),
+        _ => Ok(map_json(v, text, "", target)),
+    }
+}
+
 fn validate_json(v: &Value) -> Result<(), ProviderError> {
     match v {
         Value::String(s) => validate_template(s),
@@ -596,6 +636,31 @@ error = { jsonpath = "$.error" }
             p.map_request("x".repeat(5001).as_str(), "en", "zh-Hans")
                 .is_err()
         );
+    }
+    #[test]
+    fn empty_auto_source_omits_whole_query_and_json_fields() {
+        let s = LIBRE
+            .replace(
+                "[request]\n",
+                "[languages]\nauto = \"\"\n\n[request]\nquery = { source = \"{{src}}\" }\n",
+            )
+            .replace("{{secret.libre-key}}", "key");
+        let p = ProviderDefinition::from_toml(&s).unwrap();
+        let mapped = p.map_request("hello", "auto", "fr").unwrap();
+        assert!(!mapped.query.contains_key("source"));
+        assert!(mapped.body.unwrap().get("source").is_none());
+    }
+    #[test]
+    fn empty_auto_source_rejects_mixed_source_template() {
+        let s = LIBRE
+            .replace("[request]\n", "[languages]\nauto = \"\"\n\n[request]\n")
+            .replace("source = \"{{src}}\"", "source = \"prefix-{{src}}\"")
+            .replace("{{secret.libre-key}}", "key");
+        let p = ProviderDefinition::from_toml(&s).unwrap();
+        assert!(matches!(
+            p.map_request("hello", "auto", "fr"),
+            Err(ProviderError::Template(_))
+        ));
     }
     #[test]
     fn secret_placeholder_fails_closed() {
