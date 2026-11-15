@@ -6,7 +6,6 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// A declarative web translation provider configuration.
 /// Provider identity and capabilities.
 pub struct ProviderDefinition {
@@ -24,7 +23,6 @@ pub struct ProviderDefinition {
     pub response: Response,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// Provider identity and basic input limits.
 pub struct Provider {
     /// Stable provider identifier.
@@ -55,7 +53,6 @@ fn default_timeout_seconds() -> u64 {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// Language support configuration.
 pub struct Languages {
     #[serde(default)]
@@ -69,7 +66,6 @@ pub struct Languages {
     pub only: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// HTTP request template; execution is outside this crate.
 pub struct Request {
     #[serde(default)]
@@ -89,7 +85,6 @@ pub struct Request {
     pub body: Option<Body>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// JSON request body configuration.
 pub struct Body {
     #[serde(default)]
@@ -108,7 +103,6 @@ impl Default for Body {
     }
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// Response extraction configuration.
 pub struct Response {
     #[serde(default)]
@@ -121,7 +115,6 @@ pub struct Response {
     pub error: Option<Selector>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 /// A supported, restricted JSONPath selector.
 pub struct Selector {
     /// Path to the selected response value.
@@ -136,7 +129,7 @@ pub struct Selector {
 }
 #[derive(Clone, Debug)]
 /// A provider definition that passed schema validation.
-pub struct ValidatedProvider(ProviderDefinition);
+pub struct ValidatedProvider(ProviderDefinition, Vec<String>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Errors raised while parsing, validating, mapping, or extracting.
 pub enum ProviderError {
@@ -177,6 +170,50 @@ pub struct MappedRequest {
     /// Mapped JSON body, if configured.
     pub body: Option<Value>,
 }
+
+fn prune_unknown(value: &mut toml::Value, path: &str, warnings: &mut Vec<String>) {
+    let Some(table) = value.as_table_mut() else {
+        return;
+    };
+    let schema: &[&str] = match path {
+        "" => &["provider", "languages", "request", "response"],
+        "provider" => &[
+            "id",
+            "name",
+            "enabled",
+            "unofficial",
+            "auto_translate",
+            "max_chars",
+            "timeout_seconds",
+        ],
+        "languages" => &["auto", "map", "only"],
+        "request" => &["method", "url", "query", "headers", "body"],
+        "request.body" => &["content_type", "json"],
+        "response" => &["html_decode", "text", "error"],
+        "response.text" | "response.error" => &["jsonpath", "regex", "join"],
+        _ => return,
+    };
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        let full = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        if !schema.contains(&key.as_str()) {
+            warnings.push(full);
+            table.remove(&key);
+        } else if !matches!(
+            full.as_str(),
+            "languages.map" | "request.query" | "request.headers" | "request.body.json"
+        ) && let Some(child) = table.get_mut(&key)
+        {
+            prune_unknown(child, &full, warnings);
+        }
+    }
+    warnings.sort();
+}
+
 impl ProviderDefinition {
     /// Loads TOML provider definitions in filename order, keeping errors isolated per file.
     pub fn load_folder(path: impl AsRef<std::path::Path>) -> FolderLoadReport {
@@ -237,7 +274,7 @@ impl ProviderDefinition {
     }
     /// Parses and validates a TOML provider definition.
     pub fn from_toml(s: &str) -> Result<ValidatedProvider, ProviderError> {
-        let d: Self = toml::from_str(s).map_err(|error: toml::de::Error| {
+        let mut value: toml::Value = toml::from_str(s).map_err(|error: toml::de::Error| {
             let position = error.span().map(|span| {
                 let before = &s[..span.start];
                 let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
@@ -250,7 +287,14 @@ impl ProviderDefinition {
                 error.message()
             ))
         })?;
-        d.validate()
+        let mut warnings = Vec::new();
+        prune_unknown(&mut value, "", &mut warnings);
+        let d: Self = value
+            .try_into()
+            .map_err(|_| ProviderError::Parse("invalid provider definition".into()))?;
+        let mut validated = d.validate()?;
+        validated.1 = warnings;
+        Ok(validated)
     }
     /// Checks configuration constraints and returns a validated provider.
     pub fn validate(self) -> Result<ValidatedProvider, ProviderError> {
@@ -302,7 +346,7 @@ impl ProviderDefinition {
         if let Some(body) = &self.request.body {
             validate_json(&body.json)?;
         }
-        Ok(ValidatedProvider(self))
+        Ok(ValidatedProvider(self, Vec::new()))
     }
 }
 /// Results from loading a directory of provider files.
@@ -330,6 +374,10 @@ impl ValidatedProvider {
     /// Returns the validated provider definition.
     pub fn definition(&self) -> &ProviderDefinition {
         &self.0
+    }
+    /// Unknown configuration field paths, sorted for deterministic diagnostics.
+    pub fn warnings(&self) -> &[String] {
+        &self.1
     }
     /// Sends a mapped request with the provider timeout and an 8 MiB response limit.
     pub fn send(&self, request: &MappedRequest) -> Result<Vec<u8>, ProviderError> {
@@ -1023,12 +1071,22 @@ error = { jsonpath = "$.error" }
         assert_eq!(m.query["lang"], "en-fr");
     }
     #[test]
-    fn unknown_fields_are_rejected() {
+    fn unknown_fields_warn_and_keep_definition_defaults() {
+        let source = "[provider]\nid = 'test'\nname = 'Test'\nmax_char = 'TOP_SECRET'\nfuture_flag = 1\n[request]\nmethod = 'GET'\nurl = 'https://example.org'\n[response]\ntext = { jsonpath = '$.result' }\n";
+        let parsed = ProviderDefinition::from_toml(source).unwrap();
+        assert_eq!(parsed.definition().provider.max_chars, 1000);
+        assert_eq!(
+            parsed.warnings(),
+            &[
+                "provider.future_flag".to_string(),
+                "provider.max_char".to_string()
+            ]
+        );
         assert!(
-            ProviderDefinition::from_toml(
-                &LIBRE.replace("enabled = true", "enabled = true\nfuture_option = 1")
-            )
-            .is_err()
+            parsed
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("TOP_SECRET"))
         );
     }
     #[test]

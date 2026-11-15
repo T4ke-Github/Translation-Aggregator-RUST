@@ -177,6 +177,159 @@ where
     })
 }
 
+/// How source contexts feed their configured merged context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeMode {
+    /// Forward each piece to the merged context on arrival.
+    Stream,
+    /// Forward buffered text when the source context flushes.
+    OnFlush,
+}
+
+/// Buffer policy. Time values are caller-supplied monotonic milliseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferSettings {
+    /// Whether the context accepts text.
+    pub enabled: bool,
+    /// Idle time after the last piece before flushing, in milliseconds.
+    pub idle_delay_ms: u64,
+    /// Optional route into the merged context.
+    pub merge: Option<MergeMode>,
+}
+impl Default for BufferSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_delay_ms: 0,
+            merge: None,
+        }
+    }
+}
+impl BufferSettings {
+    /// Choose the default idle delay for an input context.
+    pub fn default_for(context: &str) -> Self {
+        Self {
+            idle_delay_ms: if matches!(context, "api" | "plugin") {
+                250
+            } else {
+                0
+            },
+            ..Self::default()
+        }
+    }
+}
+
+/// Text emitted by an idle flush, with its destination context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlushedText {
+    /// Destination context.
+    pub context: String,
+    /// Text in arrival order.
+    pub text: String,
+}
+
+#[derive(Default)]
+struct Pending {
+    text: String,
+    last_at: u64,
+}
+
+/// Deterministic idle buffer. Call `flush_due` with the same monotonic clock as `push`.
+/// Merges are emitted into a separately configured context, in sorted source-context order on flush.
+pub struct InputBuffer {
+    settings: HashMap<String, BufferSettings>,
+    pending: HashMap<String, Pending>,
+}
+impl Default for InputBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl InputBuffer {
+    /// Create an empty buffer with default policies.
+    pub fn new() -> Self {
+        Self {
+            settings: HashMap::new(),
+            pending: HashMap::new(),
+        }
+    }
+    /// Set a context policy, dropping pending text when it becomes disabled.
+    pub fn configure(&mut self, context: &str, settings: BufferSettings) {
+        self.settings.insert(context.to_owned(), settings);
+        if !settings.enabled {
+            self.pending.remove(context);
+        }
+    }
+    /// Add a piece at monotonic `now_ms`, returning any immediate output.
+    pub fn push(&mut self, context: &str, text: &str, now_ms: u64) -> Vec<FlushedText> {
+        let cfg = self
+            .settings
+            .get(context)
+            .copied()
+            .unwrap_or_else(|| BufferSettings::default_for(context));
+        if !cfg.enabled {
+            return Vec::new();
+        }
+        if context != "merged" && cfg.merge == Some(MergeMode::Stream) {
+            return self.push("merged", text, now_ms);
+        }
+        if cfg.idle_delay_ms == 0 {
+            if context != "merged" && cfg.merge == Some(MergeMode::OnFlush) {
+                return self.push("merged", text, now_ms);
+            }
+            return vec![FlushedText {
+                context: context.into(),
+                text: text.into(),
+            }];
+        }
+        let pending = self.pending.entry(context.into()).or_default();
+        pending.text.push_str(text);
+        pending.last_at = now_ms;
+        Vec::new()
+    }
+    /// Emit contexts whose idle delay has passed at monotonic `now_ms`.
+    pub fn flush_due(&mut self, now_ms: u64) -> Vec<FlushedText> {
+        let mut due: Vec<String> = self
+            .pending
+            .iter()
+            .filter_map(|(ctx, p)| {
+                let cfg = self
+                    .settings
+                    .get(ctx)
+                    .copied()
+                    .unwrap_or_else(|| BufferSettings::default_for(ctx));
+                (cfg.enabled && now_ms.saturating_sub(p.last_at) >= cfg.idle_delay_ms)
+                    .then(|| ctx.clone())
+            })
+            .collect();
+        due.sort();
+        let mut out = Vec::new();
+        let mut merged = String::new();
+        for ctx in due {
+            let Some(pending) = self.pending.remove(&ctx) else {
+                continue;
+            };
+            let cfg = self
+                .settings
+                .get(&ctx)
+                .copied()
+                .unwrap_or_else(|| BufferSettings::default_for(&ctx));
+            if ctx != "merged" && cfg.merge == Some(MergeMode::OnFlush) {
+                merged.push_str(&pending.text);
+            } else {
+                out.push(FlushedText {
+                    context: ctx,
+                    text: pending.text,
+                });
+            }
+        }
+        if !merged.is_empty() {
+            out.extend(self.push("merged", &merged, now_ms));
+        }
+        out
+    }
+}
+
 /// Pure text acceptance state; callers invoke this after a flush.
 #[derive(Default)]
 pub struct TextFilter {
@@ -300,6 +453,199 @@ fn contains_japanese_script(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_flushes_idle_per_context_and_merges_configured_sources() {
+        let mut b = InputBuffer::new();
+        b.configure("api", BufferSettings::default_for("api"));
+        assert!(b.push("api", "a", 0).is_empty());
+        assert!(b.push("api", "b", 50).is_empty());
+        assert!(b.push("api", "c", 100).is_empty());
+        assert!(b.flush_due(349).is_empty());
+        assert_eq!(
+            b.flush_due(350),
+            [FlushedText {
+                context: "api".into(),
+                text: "abc".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn buffer_defaults_immediate_and_contexts_are_independent() {
+        let mut b = InputBuffer::new();
+        assert_eq!(BufferSettings::default_for("clipboard").idle_delay_ms, 0);
+        assert_eq!(BufferSettings::default_for("typed").idle_delay_ms, 0);
+        assert_eq!(BufferSettings::default_for("api").idle_delay_ms, 250);
+        assert_eq!(BufferSettings::default_for("plugin").idle_delay_ms, 250);
+        b.configure(
+            "a",
+            BufferSettings {
+                idle_delay_ms: 10,
+                ..Default::default()
+            },
+        );
+        b.configure(
+            "b",
+            BufferSettings {
+                idle_delay_ms: 20,
+                ..Default::default()
+            },
+        );
+        assert!(b.push("a", "A", 0).is_empty());
+        assert_eq!(b.push("typed", "T", 0)[0].text, "T");
+        assert!(b.push("b", "B", 0).is_empty());
+        assert_eq!(b.flush_due(10)[0].context, "a");
+        assert_eq!(b.flush_due(20)[0].context, "b");
+    }
+
+    #[test]
+    fn disabling_context_discards_pending_and_merge_modes_are_deterministic() {
+        let mut b = InputBuffer::new();
+        b.configure(
+            "x",
+            BufferSettings {
+                idle_delay_ms: 5,
+                merge: Some(MergeMode::OnFlush),
+                ..Default::default()
+            },
+        );
+        b.configure(
+            "y",
+            BufferSettings {
+                idle_delay_ms: 5,
+                merge: Some(MergeMode::OnFlush),
+                ..Default::default()
+            },
+        );
+        b.configure(
+            "merged",
+            BufferSettings {
+                idle_delay_ms: 7,
+                ..Default::default()
+            },
+        );
+        b.push("x", "X", 0);
+        b.push("y", "Y", 0);
+        assert!(b.flush_due(5).is_empty());
+        assert!(b.push("merged", "!", 7).is_empty());
+        assert_eq!(b.flush_due(14)[0].text, "XY!");
+        b.configure(
+            "z",
+            BufferSettings {
+                idle_delay_ms: 20,
+                ..Default::default()
+            },
+        );
+        b.push("z", "drop", 20);
+        b.configure(
+            "z",
+            BufferSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        assert!(b.flush_due(100).is_empty());
+    }
+
+    #[test]
+    fn merge_stream_routes_each_piece_through_merged_idle_buffer() {
+        let mut b = InputBuffer::new();
+        b.configure(
+            "x",
+            BufferSettings {
+                merge: Some(MergeMode::Stream),
+                ..Default::default()
+            },
+        );
+        b.configure(
+            "y",
+            BufferSettings {
+                merge: Some(MergeMode::Stream),
+                ..Default::default()
+            },
+        );
+        b.configure(
+            "merged",
+            BufferSettings {
+                idle_delay_ms: 10,
+                ..Default::default()
+            },
+        );
+        assert!(b.push("x", "A", 0).is_empty());
+        assert!(b.push("y", "B", 5).is_empty());
+        assert_eq!(b.flush_due(15)[0].text, "AB");
+    }
+
+    #[test]
+    fn merge_stream_ignores_source_delay_and_preserves_arrival_order() {
+        let mut buffer = InputBuffer::new();
+        buffer.configure(
+            "x",
+            BufferSettings {
+                idle_delay_ms: 250,
+                merge: Some(MergeMode::Stream),
+                ..Default::default()
+            },
+        );
+        buffer.configure(
+            "y",
+            BufferSettings {
+                idle_delay_ms: 250,
+                merge: Some(MergeMode::Stream),
+                ..Default::default()
+            },
+        );
+        buffer.configure(
+            "merged",
+            BufferSettings {
+                idle_delay_ms: 10,
+                ..Default::default()
+            },
+        );
+        assert!(buffer.push("y", "first", 0).is_empty());
+        assert!(buffer.push("x", "second", 5).is_empty());
+        assert!(buffer.flush_due(14).is_empty());
+        assert_eq!(
+            buffer.flush_due(15),
+            vec![FlushedText {
+                context: "merged".into(),
+                text: "firstsecond".into(),
+            }]
+        );
+        assert!(buffer.flush_due(250).is_empty());
+    }
+
+    #[test]
+    fn merge_on_flush_emits_immediately_with_zero_merged_delay() {
+        let mut buffer = InputBuffer::new();
+        buffer.configure(
+            "x",
+            BufferSettings {
+                idle_delay_ms: 5,
+                merge: Some(MergeMode::OnFlush),
+                ..Default::default()
+            },
+        );
+        buffer.configure(
+            "y",
+            BufferSettings {
+                idle_delay_ms: 5,
+                merge: Some(MergeMode::OnFlush),
+                ..Default::default()
+            },
+        );
+        buffer.push("x", "A", 0);
+        buffer.push("y", "B", 0);
+        assert_eq!(
+            buffer.flush_due(5),
+            vec![FlushedText {
+                context: "merged".into(),
+                text: "AB".into(),
+            }]
+        );
+        assert!(buffer.flush_due(10).is_empty());
+    }
 
     #[test]
     fn japanese_filter_requires_japanese_script_and_preserves_text() {
