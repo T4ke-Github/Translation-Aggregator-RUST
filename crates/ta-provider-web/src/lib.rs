@@ -245,20 +245,27 @@ impl ValidatedProvider {
     pub fn send(&self, request: &MappedRequest) -> Result<Vec<u8>, ProviderError> {
         use std::io::Read;
         const MAX: u64 = 8 * 1024 * 1024;
-        let agent = ureq::AgentBuilder::new()
-            .redirects(0)
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(
                 self.0.provider.timeout_seconds.max(1),
             ))
-            .build();
-        let mut outgoing = agent.request(&request.method, &request.url);
+            .build()
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let mut outgoing = client.request(
+            request
+                .method
+                .parse::<reqwest::Method>()
+                .map_err(|e| ProviderError::Transport(e.to_string()))?,
+            &request.url,
+        );
         for (name, value) in &request.query {
-            outgoing = outgoing.query(name, value);
+            outgoing = outgoing.query(&[(name, value)]);
         }
         for (name, value) in &request.headers {
-            outgoing = outgoing.set(name, value);
+            outgoing = outgoing.header(name, value);
         }
-        let result = if let Some(body) = &request.body {
+        if let Some(body) = &request.body {
             let content_type = self
                 .0
                 .request
@@ -267,36 +274,25 @@ impl ValidatedProvider {
                 .map(|b| b.content_type.as_str())
                 .filter(|s| !s.is_empty())
                 .unwrap_or("application/json");
-            outgoing
-                .set("Content-Type", content_type)
-                .send_string(&body.to_string())
-        } else {
-            outgoing.call()
-        };
-        let response = match result {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, _)) => return Err(ProviderError::HttpStatus(code)),
-            Err(ureq::Error::Transport(e)) => {
-                let mut cause = std::error::Error::source(&e);
-                while let Some(error) = cause {
-                    if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                        matches!(
-                            io.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        )
-                    }) {
-                        return Err(ProviderError::Timeout);
-                    }
-                    cause = error.source();
-                }
-                return Err(ProviderError::Transport(e.kind().to_string()));
+            outgoing = outgoing
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .json(body);
+        }
+        let mut response = outgoing.send().map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::Timeout
+            } else {
+                ProviderError::Transport(e.to_string())
             }
-        };
-        if !(200..300).contains(&response.status()) {
-            return Err(ProviderError::HttpStatus(response.status()));
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderError::HttpStatus(status.as_u16()));
         }
         if response
-            .header("Content-Length")
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|n| n > MAX)
         {
@@ -304,7 +300,7 @@ impl ValidatedProvider {
         }
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .by_ref()
             .take(MAX + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| ProviderError::Transport(e.kind().to_string()))?;
@@ -731,6 +727,26 @@ error = { jsonpath = "$.error" }
             String::from_utf8(received).unwrap()
         });
         (url, handle)
+    }
+
+    #[test]
+    fn transport_does_not_follow_redirects() {
+        let (url, server) = serve_once(302, "redirect body");
+        let source = format!(
+            "[provider]\nid='local'\nname='Local'\n[request]\nmethod='GET'\nurl='{url}'\n[response]\ntext={{jsonpath='$.translatedText'}}"
+        );
+        let provider = ProviderDefinition::from_toml(&source).unwrap();
+        let request = provider.map_request("x", "ja", "en").unwrap();
+        assert!(matches!(
+            provider.send(&request),
+            Err(ProviderError::HttpStatus(302))
+        ));
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("GET /translate HTTP/1.1")
+        );
     }
 
     #[test]

@@ -79,47 +79,79 @@ pub struct LoadedSettings {
     pub recovered_from_backup: bool,
 }
 
-/// Load settings, falling back to a valid `.bak` without altering either file.
+/// Load settings, recovering from corrupt files without discarding their bytes.
 pub fn load_settings(path: &Path) -> io::Result<LoadedSettings> {
-    let primary = fs::read_to_string(path);
-    match primary {
-        Ok(text) => match SettingsDocument::parse(&text) {
-            Ok(document) => Ok(LoadedSettings {
-                document,
-                recovered_from_backup: false,
-            }),
-            Err(primary_error) => load_backup(path, primary_error),
+    let primary_error = match fs::read(path) {
+        Ok(bytes) => match parse_settings_bytes(&bytes) {
+            Ok(document) => {
+                return Ok(LoadedSettings {
+                    document,
+                    recovered_from_backup: false,
+                });
+            }
+            Err(error) => error,
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(LoadedSettings {
-            document: SettingsDocument::parse("").expect("empty TOML is valid"),
-            recovered_from_backup: false,
-        }),
-        Err(e) => load_backup(path, e),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(empty_settings()),
+        Err(error) => return Err(error),
+    };
+    if let Ok(bytes) = fs::read(backup_path(path))
+        && let Ok(mut document) = parse_settings_bytes(&bytes)
+    {
+        quarantine_corrupt_primary(path)?;
+        document.warnings.push(format!(
+            "{}: {primary_error}; recovered from backup",
+            path.display()
+        ));
+        return Ok(LoadedSettings {
+            document,
+            recovered_from_backup: true,
+        });
+    }
+    let mut loaded = empty_settings();
+    loaded.document.warnings.push(format!(
+        "{}: {primary_error}; backup unavailable or invalid; using defaults",
+        path.display()
+    ));
+    Ok(loaded)
+}
+
+fn empty_settings() -> LoadedSettings {
+    LoadedSettings {
+        document: SettingsDocument::parse("").expect("empty TOML is valid"),
+        recovered_from_backup: false,
     }
 }
 
-fn load_backup(path: &Path, primary_error: impl std::fmt::Display) -> io::Result<LoadedSettings> {
-    let backup = path.with_file_name(format!(
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
         "{}.bak",
         path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let text = fs::read_to_string(&backup).map_err(|backup_error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("settings invalid ({primary_error}); backup unavailable: {backup_error}"),
-        )
-    })?;
-    let document = SettingsDocument::parse(&text).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("settings invalid ({primary_error}); backup invalid: {e}"),
-        )
-    })?;
-    Ok(LoadedSettings {
-        document,
-        recovered_from_backup: true,
-    })
+    ))
 }
+
+fn parse_settings_bytes(bytes: &[u8]) -> Result<SettingsDocument, String> {
+    if bytes.is_empty() {
+        return Err("settings file is empty".to_owned());
+    }
+    if bytes.contains(&0) {
+        return Err("settings file contains NUL bytes".to_owned());
+    }
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "settings file is not valid UTF-8".to_owned())?;
+    SettingsDocument::parse(text)
+}
+
+fn quarantine_corrupt_primary(path: &Path) -> io::Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let stem = name.strip_suffix(".toml").unwrap_or(&name);
+    let corrupt = path.with_file_name(format!("{stem}.corrupt-{stamp}.toml"));
+    fs::rename(path, corrupt)
+}
+
 const SETTINGS_FILE: &str = "settings.toml";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -314,8 +346,111 @@ answer = 42 # comment\n";
         fs::write(dir.join("settings.toml.bak"), "schema_version = 1\n").unwrap();
         let recovered = load_settings(&path).unwrap();
         assert!(recovered.recovered_from_backup);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "invalid = [\n");
+        assert!(!path.exists());
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("settings.corrupt-")
+                })
+        );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_primary_recovers_backup_and_quarantines_primary() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        let corrupt = b"invalid = [\n";
+        fs::write(&path, corrupt).unwrap();
+        fs::write(dir.join("settings.toml.bak"), "schema_version = 1\n").unwrap();
+
+        let loaded = load_settings(&path).unwrap();
+        assert!(loaded.recovered_from_backup);
+        assert!(
+            loaded
+                .document
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("recovered from backup"))
+        );
+        assert!(!path.exists());
+        let quarantined: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("settings.corrupt-")
+                    && candidate.extension().is_some_and(|ext| ext == "toml")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), corrupt);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_primary_and_backup_use_empty_defaults_and_preserve_both() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        let primary = b"broken = [\n";
+        let backup = b"also = [\n";
+        fs::write(&path, primary).unwrap();
+        fs::write(dir.join("settings.toml.bak"), backup).unwrap();
+
+        let loaded = load_settings(&path).unwrap();
+        assert!(!loaded.recovered_from_backup);
+        assert_eq!(loaded.document.version(), 1);
+        assert_eq!(loaded.document.to_string(), "");
+        assert!(
+            loaded
+                .document
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("using defaults"))
+        );
+        assert_eq!(fs::read(&path).unwrap(), primary);
+        assert_eq!(fs::read(dir.join("settings.toml.bak")).unwrap(), backup);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_nul_and_non_utf8_primary_recover_valid_backup() {
+        for (index, invalid) in [Vec::new(), vec![0, 1], vec![0xff, 0xfe]]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = temp_dir();
+            let path = dir.join("settings.toml");
+            fs::write(&path, &invalid).unwrap();
+            fs::write(dir.join("settings.toml.bak"), "schema_version = 1\n").unwrap();
+            let loaded = load_settings(&path).unwrap_or_else(|e| panic!("case {index}: {e}"));
+            assert!(loaded.recovered_from_backup, "case {index}");
+            let quarantined = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|candidate| {
+                    candidate
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("settings.corrupt-")
+                })
+                .expect("corrupt primary quarantined");
+            assert_eq!(fs::read(quarantined).unwrap(), invalid);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
