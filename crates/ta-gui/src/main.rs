@@ -1,9 +1,10 @@
 //! Headless developer console harness for deterministic input preparation.
 #![forbid(unsafe_code)]
+mod clipboard;
 
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
     path::Path,
     process::ExitCode,
 };
@@ -129,37 +130,45 @@ fn run_with_provider(
     if !provider.definition().provider.enabled {
         return Err("provider is disabled".into());
     }
+    let chunks = provider
+        .manual_chunks(&input.processed_text)
+        .map_err(|error| format!("provider request: {error}"))?;
+    let mut requests = Vec::with_capacity(chunks.len());
     let mut secrets = std::collections::BTreeMap::new();
-    let request = loop {
-        match provider.map_request_with_values(
-            &input.processed_text,
-            source,
-            target,
-            &std::collections::BTreeMap::new(),
-            &secrets,
-        ) {
-            Ok(request) => break request,
-            Err(ta_provider_web::ProviderError::NeedsSecret(name)) => {
-                if secrets.contains_key(&name) || secrets.len() >= 64 {
-                    return Err("Needs key".into());
+    let params = std::collections::BTreeMap::new();
+    for chunk in &chunks {
+        let request = loop {
+            match provider.map_request_with_values(chunk, source, target, &params, &secrets) {
+                Ok(request) => break request,
+                Err(ta_provider_web::ProviderError::NeedsSecret(name)) => {
+                    if secrets.contains_key(&name) || secrets.len() >= 64 {
+                        return Err("Needs key".into());
+                    }
+                    let value = ta_platform::credentials::read_secret(&name)
+                        .map_err(|_| "Needs key (credential store unavailable)".to_owned())?
+                        .ok_or_else(|| "Needs key".to_owned())?;
+                    secrets.insert(name, value);
                 }
-                let value = ta_platform::credentials::read_secret(&name)
-                    .map_err(|_| "Needs key (credential store unavailable)".to_owned())?
-                    .ok_or_else(|| "Needs key".to_owned())?;
-                secrets.insert(name, value);
+                Err(error) => return Err(format!("provider request: {error}")),
             }
-            Err(error) => return Err(format!("provider request: {error}")),
+        };
+        if ta_provider_web::requires_insecure_http_confirmation(&request.url, true) {
+            return Err("refusing non-loopback HTTP provider in console mode".into());
         }
-    };
-    if ta_provider_web::requires_insecure_http_confirmation(&request.url, true) {
-        return Err("refusing non-loopback HTTP provider in console mode".into());
+        requests.push(request);
     }
-    let bytes = provider
-        .send(&request)
-        .map_err(|e| format!("provider send: {e}"))?;
-    let translation = provider
-        .extract_translation_from_bytes(&bytes)
-        .map_err(|e| format!("provider reply: {e}"))?;
+    let secrets: Vec<_> = secrets.into_iter().collect();
+    let mut translation = String::new();
+    for request in &requests {
+        let result = provider.send_translation(request).map_err(|error| {
+            format!(
+                "provider send: {}",
+                ta_provider_web::redact_secrets(&error.to_string(), &secrets)
+            )
+        })?;
+        translation.push_str(&result);
+    }
+    let translation = ta_provider_web::redact_secrets(&translation, &secrets);
     Ok(format!(
         "Original: {}\nProcessed: {}\nTranslation: {translation}\nStatus: ready",
         input.original_text, input.processed_text
@@ -181,11 +190,64 @@ fn run(text: &str, context: &str) -> Result<String, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let [flag, rest @ ..] = args.as_slice()
+        && flag == "--store-credential"
+    {
+        return match rest {
+            [name] => {
+                let stdin = io::stdin();
+                if stdin.is_terminal() {
+                    eprintln!("credential: pipe the secret on stdin");
+                    return ExitCode::FAILURE;
+                }
+                let mut secret = String::new();
+                let result = stdin
+                    .take(256 * 1024 + 3)
+                    .read_to_string(&mut secret)
+                    .and_then(|length| {
+                        if length >= 256 * 1024 + 3 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "credential input is too long",
+                            ));
+                        }
+                        ta_platform::credentials::save_secret(
+                            name,
+                            secret.trim_end_matches(['\r', '\n']),
+                        )
+                    });
+                match result {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("credential: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Usage: translation-aggregator --store-credential NAME (reads stdin)");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let [flag, rest @ ..] = args.as_slice()
+        && flag == "--clipboard"
+    {
+        return match clipboard::run(rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match parse_args(&args) {
         Ok(Mode::Help) => {
             println!(
                 "Usage: translation-aggregator (--text TEXT | --stdin) [--context ID] [--provider FILE --source LANG --target LANG]"
             );
+            println!("{}", clipboard::USAGE);
+            println!("       translation-aggregator --store-credential NAME (reads stdin)");
             ExitCode::SUCCESS
         }
         Ok(Mode::Run {
@@ -391,6 +453,49 @@ mod tests {
         let result = run_with_provider("hello", "typed", &path, "en", "fr");
         fs::remove_file(path).unwrap();
         assert!(result.unwrap_err().contains("Needs key"));
+    }
+
+    #[test]
+    fn manual_console_chunks_at_sentence_boundaries_and_rejects_indivisible_text() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ta-manual-chunks-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            format!("[provider]\nid='manual'\nname='Manual'\nenabled=true\nmax_chars=2\n[request]\nmethod='POST'\nurl='http://{addr}/translate'\nbody.json={{q='{{{{text}}}}'}}\n[response]\ntext={{jsonpath='$.translatedText'}}\n"),
+        ).unwrap();
+        let error = run_with_provider("犬。abc", "typed", &path, "ja", "en").unwrap_err();
+        assert!(error.contains("3 characters, limit 2"), "{error}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let mock_listener = listener.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            clipboard::tests::expect_request_and_reply(
+                &mock_listener,
+                "犬。",
+                r#"{"translatedText":"Dog. "}"#,
+            );
+            clipboard::tests::expect_request_and_reply(
+                &mock_listener,
+                "猫。",
+                r#"{"translatedText":"Cat."}"#,
+            );
+        });
+        let output = run_with_provider("犬。猫。", "typed", &path, "ja", "en");
+        fs::remove_file(&path).unwrap();
+        server.join().unwrap();
+        assert!(output.unwrap().contains("Translation: Dog. Cat."));
     }
 
     #[test]

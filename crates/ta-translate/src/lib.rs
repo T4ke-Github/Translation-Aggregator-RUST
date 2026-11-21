@@ -1098,6 +1098,10 @@ impl<T> ProviderQueue<T> {
         self.in_flight = next.is_some();
         next
     }
+    /// Discard work that has not started while keeping the in-flight slot occupied.
+    pub fn discard_pending(&mut self) -> Option<T> {
+        self.pending.take()
+    }
     /// Discard pending work and reset state; a later completion cannot start it.
     pub fn reset(&mut self) -> Option<T> {
         self.in_flight = false;
@@ -1212,6 +1216,19 @@ impl SlidingWindowRateLimiter {
         self.timestamps.push_back(now);
         true
     }
+
+    /// Return the remaining wait in milliseconds once all admission slots are used.
+    pub fn delay_at(&self, now: u64) -> u64 {
+        if self.limit == 0 {
+            return u64::MAX;
+        }
+        if self.timestamps.len() < self.limit {
+            return 0;
+        }
+        self.timestamps.front().map_or(0, |oldest| {
+            oldest.saturating_add(self.window).saturating_sub(now)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1240,8 +1257,10 @@ mod primitive_tests {
         let mut l = SlidingWindowRateLimiter::new(2, 100);
         assert!(l.allow_at(100));
         assert!(l.allow_at(150));
+        assert_eq!(l.delay_at(199), 1);
         assert!(!l.allow_at(199));
         assert!(!l.allow_at(50));
+        assert_eq!(l.delay_at(200), 0);
         assert!(l.allow_at(200));
     }
 }

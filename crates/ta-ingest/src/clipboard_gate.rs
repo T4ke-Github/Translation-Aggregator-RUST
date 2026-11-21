@@ -42,6 +42,20 @@ impl ClipboardGate {
         self.last_sequence = Some(current_sequence);
     }
 
+    /// Check that capture is active and the sequence is fresh before reading text.
+    pub fn can_read(&self, sequence: u32) -> bool {
+        if !self.enabled || self.paused {
+            return false;
+        }
+        if let Some(last) = self.last_sequence {
+            let change = sequence.wrapping_sub(last);
+            if change == 0 || change >= (1_u32 << 31) {
+                return false;
+            }
+        }
+        !self.recent_sequences.contains(&Some(sequence))
+    }
+
     /// Evaluate a vetted clipboard event. A self-copy flag suppresses only this event.
     pub fn accept<'a>(
         &mut self,
@@ -49,16 +63,7 @@ impl ClipboardGate {
         text: &'a str,
         is_self_copy: bool,
     ) -> Option<&'a str> {
-        if !self.enabled || self.paused {
-            return None;
-        }
-        if let Some(last) = self.last_sequence {
-            let change = sequence.wrapping_sub(last);
-            if change == 0 || change >= (1_u32 << 31) {
-                return None;
-            }
-        }
-        if self.recent_sequences.contains(&Some(sequence)) {
+        if !self.can_read(sequence) {
             return None;
         }
         self.last_sequence = Some(sequence);

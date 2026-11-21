@@ -19,6 +19,7 @@ const APP_DIR: &str = "Translation Aggregator";
 #[derive(Debug, Clone)]
 pub struct SettingsDocument {
     source: String,
+    value: toml::Value,
     version: u64,
     writable: bool,
     warnings: Vec<String>,
@@ -65,6 +66,7 @@ impl SettingsDocument {
         }
         Ok(Self {
             source: source.to_owned(),
+            value,
             version,
             writable,
             warnings,
@@ -113,6 +115,11 @@ impl SettingsDocument {
     /// Return non-fatal diagnostics found while parsing.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Parsed TOML, including settings understood by other parts of the application.
+    pub fn value(&self) -> &toml::Value {
+        &self.value
     }
 }
 

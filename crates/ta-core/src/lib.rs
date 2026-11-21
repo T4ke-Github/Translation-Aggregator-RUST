@@ -312,6 +312,12 @@ impl Default for HistoryEntryId {
     }
 }
 
+impl fmt::Display for HistoryEntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Typed provider identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProviderId(String);
@@ -348,6 +354,8 @@ pub enum ProviderOutcome {
     Result(String),
     /// Provider error message.
     Error(String),
+    /// The request was superseded before translation.
+    Skipped,
 }
 
 /// Lifecycle state of a provider result.
@@ -359,6 +367,8 @@ pub enum ProviderStatus {
     Succeeded,
     /// Request completed with an error.
     Failed,
+    /// The request was skipped without a provider failure.
+    Skipped,
 }
 
 /// Per-provider outcome and request metadata for a history entry.
@@ -438,6 +448,7 @@ pub fn encode_history_snapshot(history: &History) -> Result<String, HistorySnaps
                             outcome: match &value.outcome {
                                 ProviderOutcome::Result(text) => SnapshotOutcome::Result(text),
                                 ProviderOutcome::Error(text) => SnapshotOutcome::Error(text),
+                                ProviderOutcome::Skipped => SnapshotOutcome::Skipped,
                             },
                             status: value.status,
                             elapsed_nanos: u64::try_from(value.elapsed.as_nanos())
@@ -501,6 +512,7 @@ pub fn decode_history_snapshot(
             let outcome = match value.outcome {
                 SnapshotOutcomeOwned::Result(s) => ProviderOutcome::Result(s),
                 SnapshotOutcomeOwned::Error(s) => ProviderOutcome::Error(s),
+                SnapshotOutcomeOwned::Skipped => ProviderOutcome::Skipped,
             };
             entry.providers.insert(
                 provider,
@@ -554,6 +566,7 @@ struct SnapshotProvider<'a> {
 enum SnapshotOutcome<'a> {
     Result(&'a str),
     Error(&'a str),
+    Skipped,
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -585,6 +598,7 @@ struct SnapshotProviderOwned {
 enum SnapshotOutcomeOwned {
     Result(String),
     Error(String),
+    Skipped,
 }
 
 impl serde::Serialize for ProviderStatus {
@@ -593,6 +607,7 @@ impl serde::Serialize for ProviderStatus {
             Self::Pending => "pending",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Skipped => "skipped",
         })
     }
 }
@@ -602,6 +617,7 @@ impl<'de> serde::Deserialize<'de> for ProviderStatus {
             "pending" => Ok(Self::Pending),
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
             _ => Err(serde::de::Error::custom("invalid provider status")),
         }
     }
@@ -684,6 +700,7 @@ impl History {
                             ProviderOutcome::Result(text) | ProviderOutcome::Error(text) => {
                                 text_matches(text)
                             }
+                            ProviderOutcome::Skipped => false,
                         })
             })
             .collect();
@@ -697,6 +714,17 @@ impl History {
     /// Find an entry by its typed ID.
     pub fn get(&self, id: &HistoryEntryId) -> Option<&HistoryEntry> {
         self.entries.iter().find(|entry| &entry.id == id)
+    }
+    /// Store a provider completion if its entry is still retained.
+    pub fn record_provider(
+        &mut self,
+        id: &HistoryEntryId,
+        provider: ProviderId,
+        result: ProviderHistory,
+    ) {
+        if let Some(entry) = self.entries.iter_mut().rev().find(|entry| &entry.id == id) {
+            entry.providers.insert(provider, result);
+        }
     }
     /// Number of retained entries.
     pub fn len(&self) -> usize {

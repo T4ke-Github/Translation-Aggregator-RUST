@@ -29,10 +29,14 @@ pub const CLIPBOARD_RETRY_LIMIT: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 mod win32 {
     use super::{CLIPBOARD_RETRY_LIMIT, decode_nul_terminated, should_skip};
+    use std::cell::Cell;
     use std::io;
-    use std::thread;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::{null, null_mut};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::Foundation::{GetLastError, HWND};
+    use windows_sys::Win32::Foundation::{GetLastError, HWND, WAIT_OBJECT_0};
     use windows_sys::Win32::System::DataExchange::{
         AddClipboardFormatListener, CloseClipboard, GetClipboardData, GetClipboardSequenceNumber,
         IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
@@ -40,8 +44,181 @@ mod win32 {
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+    use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, MWMO_INPUTAVAILABLE,
+        MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_ALLINPUT, WM_CLIPBOARDUPDATE,
+        WM_QUIT,
+    };
 
     const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// Clipboard update notifications from a dedicated Windows message thread.
+    pub struct ClipboardListener {
+        changes: Receiver<()>,
+        last_sequence: Cell<u32>,
+        stop: OwnedHandle,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl ClipboardListener {
+        /// Start listening without reading the current clipboard contents.
+        pub fn new() -> io::Result<Self> {
+            // SAFETY: Null arguments request default security and an unnamed event.
+            let stop = unsafe { CreateEventW(null(), 1, 0, null()) };
+            if stop.is_null() {
+                return Err(last_error());
+            }
+            // SAFETY: CreateEventW returned a newly owned, valid event handle.
+            let stop = unsafe { OwnedHandle::from_raw_handle(stop) };
+            let worker_stop = stop.try_clone()?;
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (changes_tx, changes) = mpsc::sync_channel(1);
+            let worker = thread::Builder::new()
+                .name("clipboard-listener".into())
+                .spawn(move || {
+                    let startup =
+                        ClipboardWindow::new().and_then(|window| Ok((window, sequence_number()?)));
+                    match startup {
+                        Ok((window, sequence)) => {
+                            if ready_tx.send(Ok(sequence)).is_ok() {
+                                window.pump(&worker_stop, &changes_tx);
+                            }
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                        }
+                    }
+                })?;
+            let sequence = match ready_rx.recv().unwrap_or_else(|_| Err(listener_stopped())) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    let _ = worker.join();
+                    return Err(error);
+                }
+            };
+            Ok(Self {
+                changes,
+                last_sequence: Cell::new(sequence),
+                stop,
+                worker: Some(worker),
+            })
+        }
+
+        /// Wait for a new sequence, or return `None` when the timeout expires.
+        ///
+        /// A burst can coalesce into the current clipboard sequence. Read it from the
+        /// caller using `read_clipboard_change`, so a replaced sequence is skipped.
+        pub fn wait_for_change(&self, timeout: Duration) -> io::Result<Option<u32>> {
+            let started = Instant::now();
+            loop {
+                match self
+                    .changes
+                    .recv_timeout(timeout.saturating_sub(started.elapsed()))
+                {
+                    Ok(()) => {
+                        let sequence = sequence_number()?;
+                        if sequence != self.last_sequence.replace(sequence) {
+                            return Ok(Some(sequence));
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => return Ok(None),
+                    Err(RecvTimeoutError::Disconnected) => return Err(listener_stopped()),
+                }
+                if started.elapsed() >= timeout {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    impl Drop for ClipboardListener {
+        fn drop(&mut self) {
+            // SAFETY: The event is owned by self and remains valid during this call.
+            if unsafe { SetEvent(self.stop.as_raw_handle()) } != 0
+                && let Some(worker) = self.worker.take()
+            {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn listener_stopped() -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, "clipboard listener stopped")
+    }
+
+    struct ClipboardWindow(HWND);
+
+    impl ClipboardWindow {
+        fn new() -> io::Result<Self> {
+            // SAFETY: STATIC is a predefined class and HWND_MESSAGE requests an invisible window.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    windows_sys::w!("STATIC"),
+                    null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    null_mut(),
+                    null_mut(),
+                    null(),
+                )
+            };
+            if hwnd.is_null() {
+                return Err(last_error());
+            }
+            let window = Self(hwnd);
+            add_listener(hwnd)?;
+            Ok(window)
+        }
+
+        fn pump(&self, stop: &OwnedHandle, changes: &SyncSender<()>) {
+            let stop = stop.as_raw_handle();
+            let mut message = MSG::default();
+            loop {
+                // SAFETY: The handle array has one live event and the wait uses this thread's queue.
+                let result = unsafe {
+                    MsgWaitForMultipleObjectsEx(
+                        1,
+                        &stop,
+                        INFINITE,
+                        QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE,
+                    )
+                };
+                if result != WAIT_OBJECT_0 + 1 {
+                    return;
+                }
+                // SAFETY: The message storage is writable and null selects this thread's queue.
+                if unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } == 0 {
+                    continue;
+                }
+                match message.message {
+                    WM_QUIT => return,
+                    WM_CLIPBOARDUPDATE if message.hwnd == self.0 => {
+                        // One pending notification is enough to sample the latest clipboard state.
+                        let _ = changes.try_send(());
+                    }
+                    _ => {
+                        // SAFETY: PeekMessageW populated message with a message from this queue.
+                        unsafe { DispatchMessageW(&message) };
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for ClipboardWindow {
+        fn drop(&mut self) {
+            let _ = remove_listener(self.0);
+            // SAFETY: The window is created, pumped and destroyed on the same thread.
+            unsafe { DestroyWindow(self.0) };
+        }
+    }
 
     /// Get the current sequence without reading clipboard contents.
     pub fn sequence_number() -> io::Result<u32> {
@@ -79,12 +256,21 @@ mod win32 {
 
     /// Read CF_UNICODETEXT, skipping monitor-excluded clipboard contents.
     /// Call from a worker thread, never the UI/message-pump thread.
-    pub fn read_text() -> io::Result<Option<String>> {
+    pub fn read_text(expected_sequence: Option<u32>) -> io::Result<Option<String>> {
         let started = Instant::now();
         loop {
             // SAFETY: Null HWND means the current process requests clipboard access.
             if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
-                let result = read_open_clipboard();
+                let result = match expected_sequence {
+                    Some(expected) => sequence_number().and_then(|current| {
+                        if current == expected {
+                            read_open_clipboard()
+                        } else {
+                            Ok(None)
+                        }
+                    }),
+                    None => read_open_clipboard(),
+                };
                 // SAFETY: This call pairs with the successful OpenClipboard above.
                 let closed = unsafe { CloseClipboard() };
                 if closed == 0 && result.is_ok() {
@@ -156,6 +342,34 @@ mod win32 {
     }
 }
 
+#[cfg(windows)]
+pub use win32::ClipboardListener;
+
+/// Clipboard update notifications are only available on Windows.
+#[cfg(not(windows))]
+pub struct ClipboardListener {
+    _private: (),
+}
+
+#[cfg(not(windows))]
+impl ClipboardListener {
+    /// Return an unsupported error because the listener needs Windows.
+    pub fn new() -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "clipboard listener requires Windows",
+        ))
+    }
+
+    /// Return an unsupported error because the listener needs Windows.
+    pub fn wait_for_change(&self, _timeout: Duration) -> std::io::Result<Option<u32>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "clipboard listener requires Windows",
+        ))
+    }
+}
+
 /// Get the current clipboard change sequence without reading text.
 #[cfg(windows)]
 pub fn clipboard_sequence_number() -> std::io::Result<u32> {
@@ -188,7 +402,19 @@ pub fn remove_clipboard_listener(
 /// Read text after receiving WM_CLIPBOARDUPDATE. Returns None for skipped/non-text data.
 #[cfg(windows)]
 pub fn read_clipboard_text() -> std::io::Result<Option<String>> {
-    win32::read_text()
+    win32::read_text(None)
+}
+
+/// Read text for exactly the observed clipboard sequence, skipping stale or excluded content.
+#[cfg(windows)]
+pub fn read_clipboard_change(sequence: u32) -> std::io::Result<Option<String>> {
+    win32::read_text(Some(sequence))
+}
+
+/// Clipboard APIs are only available on Windows.
+#[cfg(not(windows))]
+pub fn read_clipboard_change(_sequence: u32) -> std::io::Result<Option<String>> {
+    read_clipboard_text()
 }
 
 /// Clipboard APIs are only available on Windows.
