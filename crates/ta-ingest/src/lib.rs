@@ -24,6 +24,8 @@ pub struct PipelineOptions {
     pub detect_loops: bool,
     /// Character-repeat cleanup mode.
     pub repeat_mode: CharacterRepeatMode,
+    /// Reduce an exact repeated phrase of 2 to 40 Unicode scalar values.
+    pub phrase_repeat: bool,
     /// Line-break cleanup mode.
     pub newline_mode: NewlineMode,
 }
@@ -35,6 +37,7 @@ impl Default for PipelineOptions {
             manual: false,
             detect_loops: false,
             repeat_mode: CharacterRepeatMode::None,
+            phrase_repeat: false,
             newline_mode: NewlineMode::Keep,
         }
     }
@@ -120,6 +123,11 @@ where
         return PreparedInput::Skipped(SkipReason::LoopDetected);
     }
     let mut text = ta_text::normalize_repeats(&accepted, options.repeat_mode);
+    if options.phrase_repeat
+        && let Some(phrase) = reduce_phrase_repeat(&text)
+    {
+        text = phrase;
+    }
     text = ta_text::normalize_newlines(&text, options.newline_mode);
     if text.trim().is_empty() {
         return PreparedInput::Skipped(SkipReason::EmptyAfterNormalization);
@@ -736,6 +744,50 @@ mod tests {
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
+
+    #[test]
+    fn phrase_repeat_runs_before_substitutions_only_when_enabled() {
+        let engine = SubstitutionEngine::new(
+            true,
+            vec![
+                ta_substitute::SubstitutionProfile::new("*")
+                    .with_rules([ta_substitute::SubstitutionRule::try_new("はい", "yes").unwrap()]),
+            ],
+        );
+        for (source, enabled, expected) in [
+            ("はいはいはい", true, "yes"),
+            ("はいはいはい", false, "yesyesyes"),
+            ("はいそう", true, "yesそう"),
+            ("あ", true, "あ"),
+        ] {
+            let mut filter = TextFilter::new();
+            let mut history = History::default();
+            let result = prepare_input(
+                TextInput::new(source).unwrap(),
+                ContextId::new("typed").unwrap(),
+                &mut filter,
+                &engine,
+                &mut history,
+                PipelineOptions {
+                    phrase_repeat: enabled,
+                    ..PipelineOptions::default()
+                },
+                PipelineTransforms {
+                    pre_substitution: |s: &str| Ok(s.to_owned()),
+                    post_substitution: |s: &str| Ok(s.to_owned()),
+                },
+            );
+            let PreparedInput::Ready(prepared) = result else {
+                panic!("expected ready")
+            };
+            assert_eq!(prepared.original_text, source);
+            assert_eq!(prepared.processed_text, expected);
+            assert_eq!(
+                history.get(&prepared.history_id).unwrap().processed_text,
+                expected
+            );
+        }
+    }
 
     #[test]
     fn marker_transforms_bracket_substitutions_and_history_precedes_routing() {
