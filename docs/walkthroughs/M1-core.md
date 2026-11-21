@@ -85,13 +85,13 @@ baseline and repeat the sequence with the other build.
 
 | Check | Steps | Expected | 64-bit | 32-bit |
 | --- | --- | --- | --- | --- |
-| Startup baseline | Wait for `Watching for clipboard changes (Ctrl+C to stop).`, then wait one second. | The existing `開始前` value produces zero requests. | Pending | Pending |
-| Japanese-only filter | Type `Set-RejectedClipboard` and wait one second. | The mock receives zero requests. | Pending | Pending |
-| Whitespace | Type `Set-WhitespaceClipboard` and wait one second. | The mock receives zero requests. | Pending | Pending |
-| Exclusion format (IN-02.1) | Type `Set-ProtectedClipboard` and wait one second. | `ひみつ` is absent from harness output and the mock receives zero requests. | Pending | Pending |
-| Clipboard to result (IN-01.1, WEB-06.2) | Type `Set-AcceptedClipboard`. | The harness prints context `clipboard`, original `こんにちは`, processed `こんばんは`, and `Good evening`. The mock receives one `POST /translate` with `q` equal to `こんばんは` (logged as Unicode escapes), `source` equal to `ja`, `target` equal to `en`, and no `api_key`. | Pending | Pending |
-| Cache hit (PIP-08.1) | Type `Set-EquivalentClipboard` after the accepted case. | The harness prints the new original, the same processed text and translation, and `Status: cached`. The mock's request count stays at one. | Pending | Pending |
-| Pause and resume (IN-02.2) | Type `pause` in the harness, set the clipboard to a fresh value, then type `resume` in the harness. | The paused value never reaches console output or the mock. The next fresh clipboard value is eligible. | Pending | Pending |
+| Startup baseline | Wait for `Watching for clipboard changes (Ctrl+C to stop).`, then wait one second. | The existing `開始前` value produces zero requests. | Passed | Passed |
+| Japanese-only filter | Type `Set-RejectedClipboard` and wait one second. | The mock receives zero requests. | Passed | Passed |
+| Whitespace | Type `Set-WhitespaceClipboard` and wait one second. | The mock receives zero requests. | Passed | Passed |
+| Exclusion format (IN-02.1) | Type `Set-ProtectedClipboard` and wait one second. | `ひみつ` is absent from harness output and the mock receives zero requests. | Passed | Passed |
+| Clipboard to result (IN-01.1, WEB-06.2) | Type `Set-AcceptedClipboard`. | The harness prints context `clipboard`, original `こんにちは`, processed `こんばんは`, and `Good evening`. The mock receives one `POST /translate` with `q` equal to `こんばんは` (logged as Unicode escapes), `source` equal to `ja`, `target` equal to `en`, and no `api_key`. | Passed | Passed |
+| Cache hit (PIP-08.1) | Type `Set-EquivalentClipboard` after the accepted case. | The harness prints the new original, the same processed text and translation, and `Status: cached`. The mock's request count stays at one. | Passed | Passed |
+| Pause and resume (IN-02.2) | Type `pause` in the harness, set the clipboard to a fresh value, then type `resume` in the harness. | The paused value never reaches console output or the mock. The next fresh clipboard value is eligible. | Passed | Passed |
 
 ## Settings and optional key
 
@@ -165,18 +165,88 @@ provider configuration also captures text and offers `Add a translator`. The cha
 options are `none`, `preset_2`, `auto_constant`, `auto_variable`, and `all`. Line breaks support
 `keep`, `remove`, and `keep_some` with `keep_first` and `keep_last` counts.
 
-## Acceptance evidence still required
+## Saved substitution profiles
+
+Add profiles to `settings.toml` to reuse substitution rules when capturing clipboard text or
+using `--text` or `--stdin`. `*` applies to every context. A matching context profile takes
+precedence over the global profile for matches of the same length. Use `*` within a context
+pattern to match multiple contexts.
+
+```toml
+[substitutions]
+enabled = true
+
+[[substitutions.profiles]]
+context = "*"
+rules = [{ match = '猫', replacement = 'Cat' }, { match = '犬', replacement = 'Dog' }]
+
+[[substitutions.profiles]]
+context = "clipboard"
+rules = [{ match = '猫', replacement = 'Kitten' }]
+```
+
+With those settings, copying `猫と犬` produces `KittenとDog`. Typed input gives `CatとDog`.
+Use an empty replacement to delete a match. Set `enabled = false` to turn substitutions off.
+Use TOML literal strings for rules containing `\n`, `\t`, or `\\` so the substitution engine
+receives the escapes. The explicit keyless `--libretranslate-server` session uses only rules
+given on its command line.
+
+Both Windows builds loaded the saved profiles from portable settings, including when the
+console was started with a different working directory.
+
+## Configured web providers
+
+With no `--libretranslate-server` override, the console loads custom `.toml` definitions from
+`%APPDATA%\Translation Aggregator\providers` or `data\providers` in portable mode.
+Use unique provider IDs. The built-in preset uses `libretranslate`.
+The [custom web services guide](../guides/custom-web-services.md) describes the definition format.
+
+Set `enabled = true` and `auto_translate = true` on each loopback provider that should
+translate new clipboard entries. Type `translate-all` to send the most recent captured entry
+to every enabled provider, including those with automatic translation off. This command also
+works while capture is paused. Off-device HTTPS providers can receive manually requested text.
+Automatic sends in the console require a loopback endpoint.
+
+Start three local mocks and point three enabled definitions at them. Delay one mock and check
+that all three receive the entry and the fast results appear while the slow request is active.
+The `Provider` line ties each outcome to its provider ID. Each completion reports elapsed time
+and cache status and stores the same fields in history. Pause capture and use
+`translate-all` to verify that an enabled manual-only provider gets the entry and a disabled
+provider gets no request. Both Windows builds passed these cases with the native clipboard.
+
+## Acceptance evidence
 
 | Criterion | Steps and evidence | Result |
 | --- | --- | --- |
-| WEB-06.1 | Copy text with a fresh configuration and confirm the console offers Add a translator with zero requests. Set the server address and repeat the smoke test. | Pending |
-| WEB-06.2 (keyed request) | Verify the built-in preset sends a configured key from Windows Credential Manager. The smoke test covers the keyless request. | Pending |
-| WEB-06.5 | Stop the mock. Start a reachable LibreTranslate instance on loopback with Japanese-to-English support. Start the harness against it and copy a Japanese sentence after readiness. Record the actual translation on both Windows targets. | Pending |
-| IN-01.1, NFR-03.1 | Run the clipboard integration check on the reference Windows PC for both targets. Measure from notification receipt to Original output, excluding configured buffering time. The spec allows up to 100 ms. | Pending |
-| IN-02.1 | Verify the excluded clipboard value produces no history entry in the required integration test. | Pending |
-| PIP-11.6 | Enable history, capture a line, wait for its result, and quit. Verify that reopening restores the snapshot and disabling retention removes it. Use a test profile. | Pending |
-| PIP-02.6, NFR-03.2 | Time a warm 500-character input with 10,000 substitution rules across five profiles on the reference Windows PC for both targets. Record timings against the 300 ms budget. Compare substitutions with observations from the running legacy app captured under [`fixtures/legacy/`](../../fixtures/legacy/README.md). | Pending |
-| IN-06.4–5, IN-07.3, IN-08.1–6, IN-09.3 | Capture context-filter cases from a running legacy build and compare the rewrite's outputs against them. | Pending |
+| PIP-02.3–5 | Exercise saved global, wildcard, and exact-context rules, an empty replacement, and the enable switch. Launch from a different working directory. | Passed on both Windows targets. |
+| PIP-04.1–2 | Send one native clipboard entry to three loopback providers and hold one until its HTTP timeout. | Passed on both targets. The fast results were delivered while the slow request was still active. |
+| PIP-04.3 | Check the provider ID, elapsed time, cache flag, and outcome on the console and associated history entry. | Passed for the M1 console and history on both targets. The local API output stream is M5. |
+| PIP-04.4–5, PIP-05.4 | Run Translate All while capture is paused. Check that manual-only providers receive it, disabled providers receive nothing, and a fresh profile offers Add a translator. | Passed on both targets. |
+| WEB-06.1 | Copy text with a fresh configuration and confirm the console offers Add a translator with zero requests. Set the server address and repeat the smoke test. | Passed on both targets with a fresh portable profile. |
+| WEB-06.2 (keyed request) | Verify the built-in preset sends a configured key from Windows Credential Manager. The smoke test covers the keyless request. | Passed on both targets. The mock verified a disposable key from Credential Manager. A missing key made no request. |
+| WEB-06.5 | Stop the mock. Start a reachable LibreTranslate instance on loopback with Japanese-to-English support. Start the harness against it and copy a Japanese sentence after readiness. Record the actual translation on both Windows targets. | Passed on both targets against LibreTranslate 1.9.6 on loopback. Input: 「今日はいい天気です。」. Console result: 「It is a good weather today。」. |
+| IN-01.1, NFR-03.1 | Run the clipboard integration check on the reference Windows PC for both targets. Measure from notification receipt to Original output, excluding configured buffering time. The spec allows up to 100 ms. | Passed on both targets on the approved M1 PC. Maximum observed upper bound was 0.78 ms on 64-bit and 0.87 ms on 32-bit. |
+| IN-02.1 | Verify the excluded clipboard value produces no history entry in the required integration test. | Passed on both targets. The retained snapshot contained only the accepted entry. |
+| PIP-11.6 | Enable history, capture a line, wait for its result, and quit. Verify that reopening restores the snapshot and disabling retention removes it. Use a test profile. | Passed on both targets. Reopening restored the original entry and its outcome. Opt-out removed the snapshot and backup. |
+| PIP-02.6, NFR-03.2 | Time a warm 500-character input with 10,000 substitution rules across five profiles on the reference Windows PC for both targets. Record timings against the 300 ms budget. Compare substitutions with observations from the running legacy app captured under [`fixtures/legacy/`](../../fixtures/legacy/README.md). | Passed on both targets on the approved M1 PC. Warm runs took 13.71 ms on 64-bit and 19.16 ms on 32-bit. Both matched the captured substitution outputs. |
+| IN-06.4–5, IN-07.3, IN-08.1–6, IN-09.3 | Capture context-filter cases from a running legacy build and compare the rewrite's outputs against them. | [Legacy fixture replay](../../fixtures/legacy/context-filters/capture.md) passed on both targets. The clipboard console also replayed the single-input cases. Automatic romaji conversion has a separate M2 acceptance check. |
+
+### Windows results on 2026-11-21
+
+The tests used revision 95f9a1f with local working-tree edits on Windows 11 Pro build 26300,
+an AMD Ryzen 7 5800X3D, and three displays. The primary display was 2560 x 1440 at 100% scale.
+The mock and history checks used synthetic clipboard values. The settings and history cases
+used disposable portable profiles.
+
+| Measurement | 64-bit MSVC | 32-bit MSVC |
+| --- | ---: | ---: |
+| Maximum clipboard write start to console Original line receipt, five warm samples, zero idle delay | 0.78 ms | 0.87 ms |
+| Warm release substitution scale test, 500 characters and 10,000 rules across five profiles | 13.71 ms | 19.16 ms |
+
+The clipboard interval is an upper bound because it starts before the Windows notification and
+ends after console output. On 2026-11-21, the owner approved this development PC for M1
+performance sign-off. On both builds, native clipboard capture met the 100 ms budget and
+the warm substitution run met the 300 ms budget.
 
 The existing scale test prints the substitution time. Run it on the reference PC after a warm-up
 run for each target and record the timings separately from the legacy fixture comparison.

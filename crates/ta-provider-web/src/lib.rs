@@ -1467,6 +1467,12 @@ pub fn requires_insecure_http_confirmation(url: &str, contains_secret: bool) -> 
     parsed.scheme() == "http" && !is_loopback(&parsed)
 }
 
+/// Whether a request URL targets the local machine.
+pub fn is_loopback_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && is_loopback(&url))
+}
+
 fn is_loopback(url: &reqwest::Url) -> bool {
     url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")

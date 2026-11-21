@@ -94,7 +94,12 @@ divergences (NFR-12.3), and the list goes into the user docs and release notes (
 | ID | Change |
 |---|---|
 | IN-02.1 | A modern clipboard listener replaces the viewer chain; content that asks monitors to skip it (password managers) is not captured. |
-| IN-08.6 | Filter fixtures may diverge where a legacy filter result is a bug; each divergence is listed. |
+| IN-06.4 | Merge-on-flush produces one merged entry. The legacy v1.0.7 probe left the Original Text pane unchanged with both source contexts enabled. |
+| IN-08.2 | Auto-constant repeat mode preserves uneven runs. The legacy fixture collapsed them. |
+| IN-08.4 | Phrase-repeat mode collapses a repeated two-character phrase within the configured range. The legacy fixture kept it. |
+| IN-08.5 | Loop detection suppresses entries after the first complete cycle. The legacy fixture kept displaying the three-entry cycle. |
+| IN-08.6 | Filter fixtures preserve observed legacy output and record the expected rewrite output for each divergence. |
+| IN-09.3 | Keep some with First = 1 and Last = 0 keeps the first line break. The legacy fixtures removed all breaks. |
 | IN-09.1 | Line-break mode "remove" puts one space where a removed break sat next to non-Japanese text; between two Japanese characters nothing is inserted. |
 | PIP-01.1 | The history entry is written after substitutions and transforms, not before, and keeps both the original and the processed text (stages 2–5 keep the legacy order). |
 | PIP-02.3 | Substitution profiles apply by input context, not by which processes are running. |
