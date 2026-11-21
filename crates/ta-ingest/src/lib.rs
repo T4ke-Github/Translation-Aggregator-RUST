@@ -24,6 +24,8 @@ pub struct PipelineOptions {
     pub detect_loops: bool,
     /// Character-repeat cleanup mode.
     pub repeat_mode: CharacterRepeatMode,
+    /// Reduce an exact repeated phrase of 2 to 40 Unicode scalar values.
+    pub phrase_repeat: bool,
     /// Line-break cleanup mode.
     pub newline_mode: NewlineMode,
 }
@@ -35,6 +37,7 @@ impl Default for PipelineOptions {
             manual: false,
             detect_loops: false,
             repeat_mode: CharacterRepeatMode::None,
+            phrase_repeat: false,
             newline_mode: NewlineMode::Keep,
         }
     }
@@ -120,6 +123,11 @@ where
         return PreparedInput::Skipped(SkipReason::LoopDetected);
     }
     let mut text = ta_text::normalize_repeats(&accepted, options.repeat_mode);
+    if options.phrase_repeat
+        && let Some(phrase) = reduce_phrase_repeat(&text)
+    {
+        text = phrase;
+    }
     text = ta_text::normalize_newlines(&text, options.newline_mode);
     if text.trim().is_empty() {
         return PreparedInput::Skipped(SkipReason::EmptyAfterNormalization);
@@ -195,6 +203,8 @@ pub struct BufferSettings {
     pub idle_delay_ms: u64,
     /// Optional route into the merged context.
     pub merge: Option<MergeMode>,
+    /// Keep only the last piece when each piece extends the one before.
+    pub phrase_extensions: bool,
 }
 impl Default for BufferSettings {
     fn default() -> Self {
@@ -202,6 +212,7 @@ impl Default for BufferSettings {
             enabled: true,
             idle_delay_ms: 0,
             merge: None,
+            phrase_extensions: false,
         }
     }
 }
@@ -231,6 +242,7 @@ pub struct FlushedText {
 #[derive(Default)]
 struct Pending {
     text: String,
+    pieces: Vec<String>,
     last_at: u64,
 }
 
@@ -284,6 +296,7 @@ impl InputBuffer {
         }
         let pending = self.pending.entry(context.into()).or_default();
         pending.text.push_str(text);
+        pending.pieces.push(text.to_owned());
         pending.last_at = now_ms;
         Vec::new()
     }
@@ -314,13 +327,15 @@ impl InputBuffer {
                 .get(&ctx)
                 .copied()
                 .unwrap_or_else(|| BufferSettings::default_for(&ctx));
-            if ctx != "merged" && cfg.merge == Some(MergeMode::OnFlush) {
-                merged.push_str(&pending.text);
+            let text = if cfg.phrase_extensions {
+                reduce_phrase_extensions(&pending.pieces).unwrap_or(pending.text)
             } else {
-                out.push(FlushedText {
-                    context: ctx,
-                    text: pending.text,
-                });
+                pending.text
+            };
+            if ctx != "merged" && cfg.merge == Some(MergeMode::OnFlush) {
+                merged.push_str(&text);
+            } else {
+                out.push(FlushedText { context: ctx, text });
             }
         }
         if !merged.is_empty() {
@@ -690,6 +705,39 @@ mod tests {
     }
 
     #[test]
+    fn phrase_extension_flush_keeps_longest_piece_only_when_enabled() {
+        for (pieces, enabled, expected) in [
+            (
+                vec!["こ", "こん", "こんに", "こんにちは"],
+                true,
+                "こんにちは",
+            ),
+            (
+                vec!["こ", "こん", "こんに", "こんにちは"],
+                false,
+                "ここんこんにこんにちは",
+            ),
+            (vec!["こ", "違う"], true, "こ違う"),
+        ] {
+            let mut buffer = InputBuffer::new();
+            buffer.configure(
+                "hook:game",
+                BufferSettings {
+                    idle_delay_ms: 10,
+                    phrase_extensions: enabled,
+                    ..Default::default()
+                },
+            );
+            for (index, piece) in pieces.iter().enumerate() {
+                assert!(buffer.push("hook:game", piece, index as u64).is_empty());
+            }
+            let last_at = pieces.len() as u64 - 1;
+            assert_eq!(buffer.flush_due(last_at + 9), Vec::<FlushedText>::new());
+            assert_eq!(buffer.flush_due(last_at + 10)[0].text, expected);
+        }
+    }
+
+    #[test]
     fn phrase_extensions_keep_the_longest_flush() {
         assert_eq!(
             reduce_phrase_extensions(["こ", "こん", "こんに", "こんにちは"]),
@@ -736,6 +784,50 @@ mod tests {
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
+
+    #[test]
+    fn phrase_repeat_runs_before_substitutions_only_when_enabled() {
+        let engine = SubstitutionEngine::new(
+            true,
+            vec![
+                ta_substitute::SubstitutionProfile::new("*")
+                    .with_rules([ta_substitute::SubstitutionRule::try_new("はい", "yes").unwrap()]),
+            ],
+        );
+        for (source, enabled, expected) in [
+            ("はいはいはい", true, "yes"),
+            ("はいはいはい", false, "yesyesyes"),
+            ("はいそう", true, "yesそう"),
+            ("あ", true, "あ"),
+        ] {
+            let mut filter = TextFilter::new();
+            let mut history = History::default();
+            let result = prepare_input(
+                TextInput::new(source).unwrap(),
+                ContextId::new("typed").unwrap(),
+                &mut filter,
+                &engine,
+                &mut history,
+                PipelineOptions {
+                    phrase_repeat: enabled,
+                    ..PipelineOptions::default()
+                },
+                PipelineTransforms {
+                    pre_substitution: |s: &str| Ok(s.to_owned()),
+                    post_substitution: |s: &str| Ok(s.to_owned()),
+                },
+            );
+            let PreparedInput::Ready(prepared) = result else {
+                panic!("expected ready")
+            };
+            assert_eq!(prepared.original_text, source);
+            assert_eq!(prepared.processed_text, expected);
+            assert_eq!(
+                history.get(&prepared.history_id).unwrap().processed_text,
+                expected
+            );
+        }
+    }
 
     #[test]
     fn marker_transforms_bracket_substitutions_and_history_precedes_routing() {
