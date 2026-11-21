@@ -341,7 +341,8 @@ fn replace_backup(staged: &Path, backup: &Path) -> io::Result<()> {
 
         let old: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
         let new: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
-        // ReplaceFileW keeps the existing backup if the replacement fails.
+        // SAFETY: both UTF-16 paths are NUL-terminated and live through the call;
+        // the optional backup and reserved arguments are null as allowed by Win32.
         if unsafe {
             ReplaceFileW(
                 old.as_ptr(),
