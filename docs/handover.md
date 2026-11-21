@@ -49,14 +49,13 @@ and history checks.
 
 ## Next M1 work
 
-1. Address PIP-05.2. Automatic console sends currently require a loopback endpoint. The one-time
-   confirmation for automatic off-device sends is still open. Keep the O10 default of remote and
-   paid auto-translation off.
-2. Audit the remaining M1 Must criteria against their specified verification methods using the
-   [spec index](specs/README.md) and [project plan](project-plan.md). The walkthrough records the
-   evidence collected so far. The published [spec tracker](../tools/spec-tracker/README.md) is private
-   and was unavailable from the previous session. Its statuses still need to be reconciled with
-   the walkthrough once an editable tracker or export is available.
+1. Run the [off-device consent walkthrough](walkthroughs/M1-core.md#automatic-off-device-translation)
+   on Windows for PIP-05.2. The console asks before the first automatic request to a fixed remote
+   HTTPS origin. Approval is stored per provider and origin. Remote providers still default to
+   manual translation under O10.
+2. Continue from the [M1 acceptance audit](m1-acceptance-audit.md). Reconcile its evidence with the
+   private [spec tracker](../tools/spec-tracker/README.md) once an editable tracker or export is
+   available. Record passes only when the specified verification method has been met.
 
 ## Later gates
 

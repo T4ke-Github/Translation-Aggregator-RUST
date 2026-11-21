@@ -850,9 +850,144 @@ text = { jsonpath = "$.translatedText" }
     drain(&mut pipeline, &mut output);
     let entry = pipeline.history.iter().next_back().unwrap();
     let result = &entry.providers[&ProviderId::new("off-device").unwrap()];
-    assert_eq!(result.status, ProviderStatus::Failed);
-    assert_eq!(
-        result.outcome,
-        ProviderOutcome::Error("automatic sending requires a loopback endpoint".into()),
+    assert_eq!(result.status, ProviderStatus::Skipped);
+    assert!(
+        String::from_utf8_lossy(&output)
+            .contains("automatic off-device sending needs confirmation")
     );
+}
+
+#[test]
+fn remote_auto_consent_is_persisted_and_bound_to_provider_and_origin() {
+    let dir = std::env::temp_dir().join(format!(
+        "ta-remote-auto-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let provider = |id: &str, host: &str, automatic: bool| {
+        let definition = ProviderDefinition::from_toml(&format!(
+            r#"
+[provider]
+id = "{id}"
+name = "Remote translator"
+enabled = true
+auto_translate = {automatic}
+[request]
+method = "POST"
+url = "https://{host}/translate?q={{{{text}}}}"
+[response]
+text = {{ jsonpath = "$.translatedText" }}
+"#,
+        ))
+        .unwrap();
+        ClipboardProvider::custom(definition, "ja", "en")
+    };
+    let mut providers = [provider("remote", "example.invalid", true)];
+    consent::configure(&mut providers, &dir, |name, id, origin| {
+        assert_eq!(
+            (name, id, origin),
+            ("Remote translator", "remote", "https://example.invalid")
+        );
+        Ok(false)
+    })
+    .unwrap();
+    assert!(!provider::permits_automatic_url(
+        "https://example.invalid/translate",
+        providers[0].approved_origin.as_deref()
+    ));
+
+    consent::configure(&mut providers, &dir, |_, _, _| Ok(true)).unwrap();
+    assert!(provider::permits_automatic_url(
+        "https://EXAMPLE.invalid:443/translate",
+        providers[0].approved_origin.as_deref()
+    ));
+    assert!(!provider::permits_automatic_url(
+        "https://other.invalid/translate",
+        providers[0].approved_origin.as_deref()
+    ));
+    assert!(!provider::permits_automatic_url(
+        "http://example.invalid/translate",
+        providers[0].approved_origin.as_deref()
+    ));
+
+    let mut providers = [
+        provider("remote", "example.invalid", true),
+        provider("other", "example.invalid", true),
+    ];
+    consent::configure(&mut providers, &dir, |_, id, _| {
+        assert_eq!(id, "other");
+        Ok(false)
+    })
+    .unwrap();
+    assert!(provider::permits_automatic_url(
+        "https://example.invalid/other",
+        providers[0].approved_origin.as_deref()
+    ));
+    assert!(!provider::permits_automatic_url(
+        "https://example.invalid/other",
+        providers[1].approved_origin.as_deref()
+    ));
+
+    let mut providers = [provider("remote", "example.invalid", false)];
+    consent::configure(&mut providers, &dir, |_, _, _| {
+        panic!("a disabled provider must not prompt")
+    })
+    .unwrap();
+    assert!(providers[0].approved_origin.is_none());
+
+    let mut providers = [provider("remote", "example.invalid", true)];
+    let mut asked = false;
+    consent::configure(&mut providers, &dir, |_, id, origin| {
+        assert_eq!((id, origin), ("remote", "https://example.invalid"));
+        asked = true;
+        Ok(true)
+    })
+    .unwrap();
+    assert!(
+        asked,
+        "disabling the provider must remove its previous approval"
+    );
+
+    let mut providers = [provider("remote", "different.invalid", true)];
+    consent::configure(&mut providers, &dir, |_, _, origin| {
+        assert_eq!(origin, "https://different.invalid");
+        Ok(false)
+    })
+    .unwrap();
+    assert!(!provider::permits_automatic_url(
+        "https://different.invalid/translate",
+        providers[0].approved_origin.as_deref()
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn remote_auto_prompt_requires_an_explicit_yes_and_warns_about_text_and_cost() {
+    for (line, expected) in [
+        (b"yes\n".as_slice(), true),
+        (b"\n", false),
+        (b"", false),
+        (b"y\n", false),
+    ] {
+        let mut output = Vec::new();
+        assert_eq!(
+            consent::prompt(
+                &mut &line[..],
+                &mut output,
+                "Example\nTranslator",
+                "example",
+                "https://example.invalid"
+            )
+            .unwrap(),
+            expected
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(r"Example\nTranslator"));
+        assert!(output.contains("https://example.invalid"));
+        assert!(output.contains("Clipboard text leaves this machine"));
+        assert!(output.contains("may cost money"));
+    }
 }

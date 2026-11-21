@@ -205,7 +205,8 @@ Set `enabled = true` and `auto_translate = true` on each loopback provider that 
 translate new clipboard entries. Type `translate-all` to send the most recent captured entry
 to every enabled provider, including those with automatic translation off. This command also
 works while capture is paused. Off-device HTTPS providers can receive manually requested text.
-Automatic sends in the console require a loopback endpoint.
+Loopback providers can send automatically when enabled. Off-device providers need a fixed HTTPS
+origin and explicit consent before automatic sends.
 
 Start three local mocks and point three enabled definitions at them. Delay one mock and check
 that all three receive the entry and the fast results appear while the slow request is active.
@@ -213,6 +214,28 @@ The `Provider` line ties each outcome to its provider ID. Each completion report
 and cache status and stores the same fields in history. Pause capture and use
 `translate-all` to verify that an enabled manual-only provider gets the entry and a disabled
 provider gets no request. Both Windows builds passed these cases with the native clipboard.
+
+## Automatic off-device translation
+
+For PIP-05.2, use an interactive Windows terminal, a disposable profile and a test HTTPS endpoint
+you control. Use synthetic clipboard text. Configure a custom provider with a fixed HTTPS host
+and an enabled flag. Start with `auto_translate` omitted or false.
+
+1. Start the console, copy a test line and confirm there is no prompt and no automatic request.
+2. Set `auto_translate = true` and restart. Confirm the prompt names the provider and shows only
+   its HTTPS origin. It must say clipboard text leaves the machine and requests may cost money.
+   Press Enter to cancel, then copy a fresh test line. No automatic request should reach the endpoint.
+3. Restart, type `yes`, wait for clipboard readiness and then copy a fresh test line. Confirm the
+   expected request arrives. Restart again with the same configuration and confirm the console
+   remembers approval without a new prompt.
+4. Change the provider's HTTPS host or port and restart. Confirm the console asks again and sends
+   nothing after cancellation. Set `auto_translate = false` and restart to remove that provider's
+   approval. Switching the provider back on requires another confirmation.
+
+Approval is stored in `remote-auto-consent.json` in the profile's data directory and applies to
+the provider ID and the exact HTTPS origin. A new approval requires an interactive terminal. The
+console validates the destination of each mapped request against the approval before sending.
+Record the run on each Windows build. Native manual confirmation is pending.
 
 ## Acceptance evidence
 

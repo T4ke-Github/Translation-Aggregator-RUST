@@ -932,6 +932,7 @@ dependencies = [
 name = "ta-gui"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "ta-core",
  "ta-dict",
  "ta-ingest",
