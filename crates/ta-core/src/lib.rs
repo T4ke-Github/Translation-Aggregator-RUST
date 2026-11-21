@@ -292,6 +292,8 @@ impl ContextTextHistory {
     }
 }
 
+static NEXT_HISTORY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Opaque, typed identity for a history entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct HistoryEntryId(u64);
@@ -299,9 +301,8 @@ pub struct HistoryEntryId(u64);
 impl HistoryEntryId {
     /// Allocate a process-unique history entry identifier.
     pub fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+        use std::sync::atomic::Ordering;
+        Self(NEXT_HISTORY_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -417,6 +418,195 @@ pub struct History {
     capacity: usize,
 }
 
+/// Encode the retained history as a versioned JSON snapshot. This contains history only.
+pub fn encode_history_snapshot(history: &History) -> Result<String, HistorySnapshotError> {
+    let entries = history
+        .entries
+        .iter()
+        .map(|entry| {
+            let elapsed_since_epoch = entry
+                .time
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_err(|_| HistorySnapshotError::InvalidData)?;
+            let providers = entry
+                .providers
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        id.as_str(),
+                        SnapshotProvider {
+                            outcome: match &value.outcome {
+                                ProviderOutcome::Result(text) => SnapshotOutcome::Result(text),
+                                ProviderOutcome::Error(text) => SnapshotOutcome::Error(text),
+                            },
+                            status: value.status,
+                            elapsed_nanos: u64::try_from(value.elapsed.as_nanos())
+                                .map_err(|_| HistorySnapshotError::InvalidData)?,
+                            cached: value.cached,
+                        },
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>, HistorySnapshotError>>()?;
+            Ok(SnapshotEntry {
+                id: entry.id.0,
+                time_secs: elapsed_since_epoch.as_secs(),
+                time_nanos: elapsed_since_epoch.subsec_nanos(),
+                context: entry.context.as_str(),
+                original_text: &entry.original_text,
+                processed_text: &entry.processed_text,
+                providers,
+            })
+        })
+        .collect::<Result<Vec<_>, HistorySnapshotError>>()?;
+    serde_json::to_string(&Snapshot {
+        version: 1,
+        entries,
+    })
+    .map_err(|_| HistorySnapshotError::InvalidData)
+}
+
+/// Decode a versioned JSON snapshot, retaining the newest entries up to `capacity`.
+pub fn decode_history_snapshot(
+    json: &str,
+    capacity: usize,
+) -> Result<History, HistorySnapshotError> {
+    let snapshot: SnapshotOwned =
+        serde_json::from_str(json).map_err(|_| HistorySnapshotError::InvalidData)?;
+    if snapshot.version != 1 {
+        return Err(HistorySnapshotError::UnsupportedVersion);
+    }
+    let mut history = History::with_capacity(capacity);
+    let mut seen = std::collections::HashSet::new();
+    let mut highest_id = 0_u64;
+    for item in snapshot.entries {
+        if item.id == 0
+            || item.id == u64::MAX
+            || !seen.insert(item.id)
+            || item.time_nanos >= 1_000_000_000
+        {
+            return Err(HistorySnapshotError::InvalidData);
+        }
+        highest_id = highest_id.max(item.id);
+        let id = HistoryEntryId(item.id);
+        let context =
+            ContextId::new(item.context).map_err(|_| HistorySnapshotError::InvalidData)?;
+        let time = std::time::SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::new(item.time_secs, item.time_nanos))
+            .ok_or(HistorySnapshotError::InvalidData)?;
+        let mut entry =
+            HistoryEntry::new(id, time, context, item.original_text, item.processed_text);
+        for (provider, value) in item.providers {
+            let provider =
+                ProviderId::new(provider).map_err(|_| HistorySnapshotError::InvalidData)?;
+            let outcome = match value.outcome {
+                SnapshotOutcomeOwned::Result(s) => ProviderOutcome::Result(s),
+                SnapshotOutcomeOwned::Error(s) => ProviderOutcome::Error(s),
+            };
+            entry.providers.insert(
+                provider,
+                ProviderHistory {
+                    outcome,
+                    status: value.status,
+                    elapsed: std::time::Duration::from_nanos(value.elapsed_nanos),
+                    cached: value.cached,
+                },
+            );
+        }
+        history.push(entry);
+    }
+    NEXT_HISTORY_ID.fetch_max(highest_id + 1, std::sync::atomic::Ordering::Relaxed);
+    Ok(history)
+}
+
+/// Snapshot decoding/encoding failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistorySnapshotError {
+    /// Unsupported snapshot format version.
+    UnsupportedVersion,
+    /// Malformed or invalid snapshot data.
+    InvalidData,
+}
+
+#[derive(serde::Serialize)]
+struct Snapshot<'a> {
+    version: u32,
+    entries: Vec<SnapshotEntry<'a>>,
+}
+#[derive(serde::Serialize)]
+struct SnapshotEntry<'a> {
+    id: u64,
+    time_secs: u64,
+    time_nanos: u32,
+    context: &'a str,
+    original_text: &'a str,
+    processed_text: &'a str,
+    providers: HashMap<&'a str, SnapshotProvider<'a>>,
+}
+#[derive(serde::Serialize)]
+struct SnapshotProvider<'a> {
+    outcome: SnapshotOutcome<'a>,
+    status: ProviderStatus,
+    elapsed_nanos: u64,
+    cached: bool,
+}
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "text")]
+enum SnapshotOutcome<'a> {
+    Result(&'a str),
+    Error(&'a str),
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotOwned {
+    version: u32,
+    entries: Vec<SnapshotEntryOwned>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotEntryOwned {
+    id: u64,
+    time_secs: u64,
+    time_nanos: u32,
+    context: String,
+    original_text: String,
+    processed_text: String,
+    providers: HashMap<String, SnapshotProviderOwned>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotProviderOwned {
+    outcome: SnapshotOutcomeOwned,
+    status: ProviderStatus,
+    elapsed_nanos: u64,
+    cached: bool,
+}
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", content = "text")]
+enum SnapshotOutcomeOwned {
+    Result(String),
+    Error(String),
+}
+
+impl serde::Serialize for ProviderStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Pending => "pending",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        })
+    }
+}
+impl<'de> serde::Deserialize<'de> for ProviderStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match <String as serde::Deserialize>::deserialize(deserializer)?.as_str() {
+            "pending" => Ok(Self::Pending),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err(serde::de::Error::custom("invalid provider status")),
+        }
+    }
+}
+
 impl Default for History {
     fn default() -> Self {
         Self::with_capacity(DEFAULT_HISTORY_CAPACITY)
@@ -529,6 +719,104 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_snapshot_restores_unique_ids_for_new_entries() {
+        let high = 1_000_000_000_u64;
+        let mut history = History::with_capacity(2);
+        history.push(HistoryEntry::new(
+            HistoryEntryId(high),
+            std::time::UNIX_EPOCH,
+            ContextId::new("typed").unwrap(),
+            "old",
+            "old",
+        ));
+        let json = encode_history_snapshot(&history).unwrap();
+        decode_history_snapshot(&json, 2).unwrap();
+        assert!(HistoryEntryId::new().0 > high);
+
+        let mut duplicate: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let same = duplicate["entries"][0].clone();
+        duplicate["entries"].as_array_mut().unwrap().push(same);
+        assert!(matches!(
+            decode_history_snapshot(&duplicate.to_string(), 2),
+            Err(HistorySnapshotError::InvalidData)
+        ));
+        let invalid = json.replace(&format!("\"id\":{high}"), "\"id\":18446744073709551615");
+        assert!(matches!(
+            decode_history_snapshot(&invalid, 2),
+            Err(HistorySnapshotError::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn history_snapshot_roundtrips_every_history_field_and_excludes_settings() {
+        let mut history = History::with_capacity(3);
+        let mut entry = HistoryEntry::new(
+            HistoryEntryId(42),
+            std::time::UNIX_EPOCH + std::time::Duration::new(12, 34),
+            ContextId::new("api:game").unwrap(),
+            "original",
+            "processed",
+        );
+        entry.providers.insert(
+            ProviderId::new("provider-a").unwrap(),
+            ProviderHistory {
+                outcome: ProviderOutcome::Error("failed".into()),
+                status: ProviderStatus::Failed,
+                elapsed: std::time::Duration::from_millis(19),
+                cached: true,
+            },
+        );
+        entry.providers.insert(
+            ProviderId::new("provider-b").unwrap(),
+            ProviderHistory {
+                outcome: ProviderOutcome::Result("translated".into()),
+                status: ProviderStatus::Succeeded,
+                elapsed: std::time::Duration::from_nanos(7),
+                cached: false,
+            },
+        );
+        history.push(entry.clone());
+        let json = encode_history_snapshot(&history).unwrap();
+        assert!(!json.contains("credential"));
+        assert!(!json.contains("settings"));
+        let restored = decode_history_snapshot(&json, 3).unwrap();
+        assert_eq!(restored.iter().next(), Some(&entry));
+    }
+
+    #[test]
+    fn history_snapshot_enforces_capacity_and_rejects_invalid_payloads() {
+        let mut history = History::with_capacity(3);
+        for id in 1..=3 {
+            history.push(HistoryEntry::new(
+                HistoryEntryId(id),
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(id),
+                ContextId::new("typed").unwrap(),
+                id.to_string(),
+                "p",
+            ));
+        }
+        let json = encode_history_snapshot(&history).unwrap();
+        let loaded = decode_history_snapshot(&json, 2).unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.id.0).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(matches!(
+            decode_history_snapshot("{", 2),
+            Err(HistorySnapshotError::InvalidData)
+        ));
+        assert!(matches!(
+            decode_history_snapshot(r#"{"version":2,"entries":[]}"#, 2),
+            Err(HistorySnapshotError::UnsupportedVersion)
+        ));
+        let invalid_id = json.replace("\"id\":1", "\"id\":0");
+        assert!(matches!(
+            decode_history_snapshot(&invalid_id, 2),
+            Err(HistorySnapshotError::InvalidData)
+        ));
+    }
 
     #[test]
     fn history_stores_provider_metadata_and_evicts_oldest_entry() {

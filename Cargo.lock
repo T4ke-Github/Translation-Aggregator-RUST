@@ -910,6 +910,8 @@ dependencies = [
 name = "ta-core"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "ta-text",
 ]
 
@@ -958,6 +960,7 @@ version = "0.0.0"
 dependencies = [
  "ta-core",
  "toml",
+ "toml_edit",
  "windows-sys 0.59.0",
 ]
 

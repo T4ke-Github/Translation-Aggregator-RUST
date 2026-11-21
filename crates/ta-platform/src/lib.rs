@@ -5,6 +5,8 @@
 
 pub mod clipboard;
 pub mod credentials;
+pub mod history_storage;
+pub mod settings_queue;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -90,18 +92,11 @@ impl SettingsDocument {
         }
         let mut source = self.source.clone();
         if self.version == 1 {
-            if let Some(line) = source.lines().find(|line| {
-                line.trim_start()
-                    .strip_prefix("schema_version")
-                    .is_some_and(|rest| rest.trim_start().starts_with('='))
-            }) {
-                let line_with_ending = format!("{line}\n");
-                if source.contains(&line_with_ending) {
-                    source = source.replacen(&line_with_ending, "", 1);
-                } else {
-                    source = source.replacen(line, "", 1);
-                }
-            }
+            let mut document: toml_edit::DocumentMut = source
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid settings TOML"))?;
+            document.remove("schema_version");
+            source = document.to_string();
             source = format!("schema_version = 1\n{source}");
         }
         atomic_save(path, source.as_bytes())
@@ -319,10 +314,7 @@ pub fn atomic_save(path: &Path, contents: &[u8]) -> io::Result<()> {
                 io::copy(&mut source, &mut dest)?;
                 dest.sync_all()?;
                 drop(dest);
-                if backup.exists() {
-                    fs::remove_file(&backup)?;
-                }
-                fs::rename(&backup_temp, &backup)
+                replace_backup(&backup_temp, &backup)
             })();
             if backup_result.is_err() {
                 let _ = fs::remove_file(&backup_temp);
@@ -341,6 +333,34 @@ pub fn atomic_save(path: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
+fn replace_backup(staged: &Path, backup: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if backup.exists() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+        let old: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
+        let new: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both UTF-16 paths are NUL-terminated and live through the call;
+        // the optional backup and reserved arguments are null as allowed by Win32.
+        if unsafe {
+            ReplaceFileW(
+                old.as_ptr(),
+                new.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    fs::rename(staged, backup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +376,22 @@ mod tests {
             std::env::temp_dir().join(format!("ta-platform-{}-{stamp}-{id}", std::process::id()));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn save_does_not_remove_nested_schema_version() {
+        let dir = temp_dir();
+        let path = dir.join("settings.toml");
+        let source = "[future]\nschema_version = 7 # keep nested key\nother = true\n";
+        SettingsDocument::parse(source)
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("schema_version = 1\n"));
+        assert!(saved.contains("schema_version = 7 # keep nested key"));
+        assert!(saved.contains("other = true"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -629,6 +665,12 @@ answer = 42 # comment\n";
         assert_eq!(
             fs::read(dir.join("settings.toml.bak")).unwrap(),
             b"old complete"
+        );
+        atomic_save(&path, b"newest complete").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"newest complete");
+        assert_eq!(
+            fs::read(dir.join("settings.toml.bak")).unwrap(),
+            b"new complete"
         );
         fs::remove_dir_all(dir).unwrap();
     }
