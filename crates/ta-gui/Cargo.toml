@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 ta-core.workspace = true
 ta-ingest.workspace = true
+ta-text.workspace = true
+ta-translate.workspace = true
 ta-substitute.workspace = true
 ta-dict.workspace = true
 ta-morph.workspace = true

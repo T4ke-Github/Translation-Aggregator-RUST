@@ -244,6 +244,7 @@ struct Pending {
     text: String,
     pieces: Vec<String>,
     last_at: u64,
+    chars: usize,
 }
 
 /// Deterministic idle buffer. Call `flush_due` with the same monotonic clock as `push`.
@@ -298,7 +299,26 @@ impl InputBuffer {
         pending.text.push_str(text);
         pending.pieces.push(text.to_owned());
         pending.last_at = now_ms;
+        pending.chars += text.chars().count();
         Vec::new()
+    }
+    /// Number of Unicode scalar values in a context's pending buffer.
+    pub fn pending_chars(&self, context: &str) -> usize {
+        self.pending.get(context).map_or(0, |pending| pending.chars)
+    }
+    /// Discard buffered pieces for this context without changing its options.
+    pub fn discard_pending(&mut self, context: &str) {
+        self.pending.remove(context);
+    }
+    /// Monotonic time at which this context's pending entry becomes due.
+    pub fn next_flush_at(&self, context: &str) -> Option<u64> {
+        let pending = self.pending.get(context)?;
+        let settings = self
+            .settings
+            .get(context)
+            .copied()
+            .unwrap_or_else(|| BufferSettings::default_for(context));
+        Some(pending.last_at.saturating_add(settings.idle_delay_ms))
     }
     /// Emit contexts whose idle delay has passed at monotonic `now_ms`.
     pub fn flush_due(&mut self, now_ms: u64) -> Vec<FlushedText> {

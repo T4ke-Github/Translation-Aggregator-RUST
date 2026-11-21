@@ -182,10 +182,49 @@ impl fmt::Display for ProviderError {
     }
 }
 impl std::error::Error for ProviderError {}
+
+/// One failed translation attempt, with the metadata needed to decide whether to retry.
+#[derive(Debug)]
+pub struct TranslationFailure {
+    /// The provider diagnostic for the user.
+    pub error: ProviderError,
+    /// The routing-layer failure class.
+    pub retry: ta_translate::RetryFailure,
+    /// The server's requested delay in seconds, if supplied.
+    pub retry_after_seconds: Option<u64>,
+}
+
+impl From<ProviderError> for TranslationFailure {
+    fn from(error: ProviderError) -> Self {
+        use ta_translate::RetryFailure;
+        let retry = match &error {
+            ProviderError::Timeout => RetryFailure::Timeout,
+            ProviderError::Transport(_) => RetryFailure::Connection,
+            ProviderError::HttpStatus(code) => RetryFailure::Http(*code),
+            _ => RetryFailure::Other,
+        };
+        Self {
+            error,
+            retry,
+            retry_after_seconds: None,
+        }
+    }
+}
+
 struct HttpResponse {
     status: reqwest::StatusCode,
     charset: Option<String>,
     body: Vec<u8>,
+    retry_after_seconds: Option<u64>,
+}
+
+fn retry_after_seconds(value: &str, now: std::time::SystemTime) -> Option<u64> {
+    let value = value.trim();
+    value.parse::<u64>().ok().or_else(|| {
+        let until = httpdate::parse_http_date(value).ok()?;
+        let duration = until.duration_since(now).unwrap_or_default();
+        Some(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
+    })
 }
 
 fn status_reason(code: u16) -> &'static str {
@@ -548,6 +587,16 @@ impl ValidatedProvider {
         };
         Ok(Some(format!("{}: {message}", self.0.provider.name)))
     }
+    /// Split manual text at sentence boundaries using the provider's request size limit.
+    pub fn manual_chunks(&self, text: &str) -> Result<Vec<String>, ProviderError> {
+        ta_translate::split_sentences(text, self.0.provider.max_chars).map_err(|error| {
+            ProviderError::Invalid(format!(
+                "Text too long for {} ({} characters, limit {})",
+                self.0.provider.name, error.actual_chars, error.max_chars
+            ))
+        })
+    }
+
     /// Translate manual text by splitting it into sentence-aware provider-sized requests.
     /// All chunks are validated and mapped before `transport` is invoked.
     pub fn send_manual_with<F>(
@@ -560,13 +609,7 @@ impl ValidatedProvider {
     where
         F: FnMut(&MappedRequest) -> Result<Vec<u8>, ProviderError>,
     {
-        let chunks =
-            ta_translate::split_sentences(text, self.0.provider.max_chars).map_err(|e| {
-                ProviderError::Invalid(format!(
-                    "Text too long for {} ({} characters, limit {})",
-                    self.0.provider.name, e.actual_chars, e.max_chars
-                ))
-            })?;
+        let chunks = self.manual_chunks(text)?;
         let requests = chunks
             .iter()
             .map(|chunk| self.map_request(chunk, source, target))
@@ -591,20 +634,44 @@ impl ValidatedProvider {
 
     /// Sends and processes a response, checking configured service errors before status and text.
     pub fn send_translation(&self, request: &MappedRequest) -> Result<String, ProviderError> {
+        self.send_translation_attempt(request)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Send one translation attempt, retaining retry metadata alongside a service error.
+    pub fn send_translation_attempt(
+        &self,
+        request: &MappedRequest,
+    ) -> Result<String, TranslationFailure> {
         let response = self.send_response(request, true)?;
         let text = decode_response_body(&response.body, response.charset.as_deref());
-        if let Some(error) = self.configured_error(&text, request)? {
-            return Err(ProviderError::Response(error));
-        }
+        let service_error = self
+            .configured_error(&text, request)?
+            .map(ProviderError::Response);
         if !response.status.is_success() {
-            return Err(ProviderError::HttpStatus(response.status.as_u16()));
+            let status = response.status.as_u16();
+            return Err(TranslationFailure {
+                error: service_error.unwrap_or(ProviderError::HttpStatus(status)),
+                retry: ta_translate::RetryFailure::Http(status),
+                retry_after_seconds: response.retry_after_seconds,
+            });
+        }
+        if let Some(error) = service_error {
+            return Err(error.into());
         }
         self.extract_translation_from_bytes(text.as_bytes())
+            .map_err(Into::into)
     }
 
     /// Returns the validated provider definition.
     pub fn definition(&self) -> &ProviderDefinition {
         &self.0
+    }
+
+    /// Override the request timeout without changing the preset's other settings.
+    pub fn with_timeout_seconds(mut self, seconds: std::num::NonZeroU64) -> Self {
+        self.0.provider.timeout_seconds = seconds.get();
+        self
     }
     /// Unknown configuration field paths, sorted for deterministic diagnostics.
     pub fn warnings(&self) -> &[String] {
@@ -626,11 +693,16 @@ impl ValidatedProvider {
     ) -> Result<HttpResponse, ProviderError> {
         use std::io::Read;
         const MAX: u64 = 8 * 1024 * 1024;
-        let client = reqwest::blocking::Client::builder()
+        let mut client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(
                 self.0.provider.timeout_seconds.max(1),
-            ))
+            ));
+        // A loopback provider must stay on this machine even when a proxy is configured.
+        if reqwest::Url::parse(&request.url).is_ok_and(|url| is_loopback(&url)) {
+            client = client.no_proxy();
+        }
+        let client = client
             .build()
             .map_err(|_| ProviderError::Transport("HTTP client setup failed".into()))?;
         let mut outgoing = client.request(
@@ -666,15 +738,24 @@ impl ValidatedProvider {
                 ProviderError::Transport("HTTP request failed".into())
             }
         })?;
-        let status = response.status();
-        if !status.is_success() && (!inspect_service_error || self.0.response.error.is_none()) {
-            return Err(ProviderError::HttpStatus(status.as_u16()));
+        let mut received = HttpResponse {
+            status: response.status(),
+            charset: response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(charset_from_content_type),
+            body: Vec::new(),
+            retry_after_seconds: response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|value| retry_after_seconds(value, std::time::SystemTime::now())),
+        };
+        let success = received.status.is_success();
+        if !success && (!inspect_service_error || self.0.response.error.is_none()) {
+            return Ok(received);
         }
-        let charset = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(charset_from_content_type);
         if response
             .headers()
             .get(reqwest::header::CONTENT_LENGTH)
@@ -682,36 +763,26 @@ impl ValidatedProvider {
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|n| n > MAX)
         {
-            return Err(if status.is_success() {
-                ProviderError::ResponseTooLarge
+            return if success {
+                Err(ProviderError::ResponseTooLarge)
             } else {
-                ProviderError::HttpStatus(status.as_u16())
-            });
+                Ok(received)
+            };
         }
         let mut bytes = Vec::new();
-        response
-            .by_ref()
-            .take(MAX + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                if status.is_success() {
-                    ProviderError::Transport(e.kind().to_string())
+        match response.by_ref().take(MAX + 1).read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() as u64 <= MAX => received.body = bytes,
+            Ok(_) if success => return Err(ProviderError::ResponseTooLarge),
+            Err(error) if success => {
+                return Err(if error.kind() == std::io::ErrorKind::TimedOut {
+                    ProviderError::Timeout
                 } else {
-                    ProviderError::HttpStatus(status.as_u16())
-                }
-            })?;
-        if bytes.len() as u64 > MAX {
-            return Err(if status.is_success() {
-                ProviderError::ResponseTooLarge
-            } else {
-                ProviderError::HttpStatus(status.as_u16())
-            });
+                    ProviderError::Transport(error.kind().to_string())
+                });
+            }
+            _ => {}
         }
-        Ok(HttpResponse {
-            status,
-            charset,
-            body: bytes,
-        })
+        Ok(received)
     }
     /// Applies placeholders to construct a request.
     pub fn map_request(
@@ -1393,18 +1464,18 @@ pub fn requires_insecure_http_confirmation(url: &str, contains_secret: bool) -> 
             .get(..7)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
     };
-    if parsed.scheme() != "http" {
-        return false;
-    }
-    match parsed.host_str() {
-        Some(host) if host.eq_ignore_ascii_case("localhost") => false,
-        Some(host) => !host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback()),
-        None => true,
-    }
+    parsed.scheme() == "http" && !is_loopback(&parsed)
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
 }
 
 /// Build the disabled official LibreTranslate preset; its server address comes from settings.
@@ -1461,6 +1532,28 @@ pub fn libretranslate_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_delay_seconds_and_http_dates() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let date = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(retry_after_seconds("12", date), Some(12));
+        assert_eq!(
+            retry_after_seconds(
+                "Sun, 06 Nov 1994 08:49:37 GMT",
+                date - Duration::from_millis(1500)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            retry_after_seconds(
+                "Sun, 06 Nov 1994 08:49:37 GMT",
+                date + Duration::from_secs(1)
+            ),
+            Some(0)
+        );
+        assert_eq!(retry_after_seconds("invalid", UNIX_EPOCH), None);
+    }
     #[test]
     fn libretranslate_preset_maps_keyless_and_keyed_requests() {
         let provider = libretranslate_preset();
