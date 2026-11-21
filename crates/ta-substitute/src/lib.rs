@@ -188,6 +188,33 @@ mod tests {
         );
     }
     #[test]
+    fn substitution_scale_uses_ten_thousand_rules_and_five_profiles() {
+        let profiles: Vec<_> = (0..5)
+            .map(|profile| {
+                let mut rules: Vec<_> = (0..2_000)
+                    .map(|index| {
+                        SubstitutionRule::try_new(
+                            &format!("unused-{profile}-{index:04}"),
+                            "ignored",
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                if profile == 4 {
+                    rules[1_999] = SubstitutionRule::try_new("x", "y").unwrap();
+                }
+                SubstitutionProfile::new("*").with_rules(rules)
+            })
+            .collect();
+        let engine = SubstitutionEngine::new(true, profiles);
+        let input = "x".repeat(500);
+        let start = std::time::Instant::now();
+        let result = std::hint::black_box(engine.apply(&input, "typed"));
+        println!("PIP-02.6 500 chars / 10k rules: {:?}", start.elapsed());
+        assert_eq!(result, "y".repeat(500));
+    }
+
+    #[test]
     fn empty_replacement_deletes_match() {
         let p =
             SubstitutionProfile::new("*").with_rules([SubstitutionRule::try_new("x", "").unwrap()]);
