@@ -1,6 +1,8 @@
 //! Headless developer console harness for deterministic input preparation.
 #![forbid(unsafe_code)]
 mod clipboard;
+mod provider_request;
+mod substitution_settings;
 
 use std::{
     env, fs,
@@ -91,17 +93,20 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
     })
 }
 
-fn prepare(text: &str, context: &str) -> Result<PreparedInput, String> {
+fn prepare(
+    text: &str,
+    context: &str,
+    substitutions: &SubstitutionEngine,
+) -> Result<PreparedInput, String> {
     let input = TextInput::new(text).map_err(|e| format!("invalid input: {e:?}"))?;
     let context = ContextId::new(context).map_err(|e| format!("invalid context: {e:?}"))?;
     let mut filter = TextFilter::new();
     let mut history = History::with_capacity(100);
-    let substitutions = SubstitutionEngine::new(false, vec![]);
     Ok(prepare_input(
         input,
         context,
         &mut filter,
-        &substitutions,
+        substitutions,
         &mut history,
         PipelineOptions::default(),
         PipelineTransforms {
@@ -117,8 +122,9 @@ fn run_with_provider(
     path: &Path,
     source: &str,
     target: &str,
+    substitutions: &SubstitutionEngine,
 ) -> Result<String, String> {
-    let prepared = prepare(text, context)?;
+    let prepared = prepare(text, context, substitutions)?;
     let PreparedInput::Ready(input) = prepared else {
         return Ok(format!(
             "Original: {text}\nProcessed: <skipped>\nStatus: skipped"
@@ -137,24 +143,14 @@ fn run_with_provider(
     let mut secrets = std::collections::BTreeMap::new();
     let params = std::collections::BTreeMap::new();
     for chunk in &chunks {
-        let request = loop {
-            match provider.map_request_with_values(chunk, source, target, &params, &secrets) {
-                Ok(request) => break request,
-                Err(ta_provider_web::ProviderError::NeedsSecret(name)) => {
-                    if secrets.contains_key(&name) || secrets.len() >= 64 {
-                        return Err("Needs key".into());
-                    }
-                    let value = ta_platform::credentials::read_secret(&name)
-                        .map_err(|_| "Needs key (credential store unavailable)".to_owned())?
-                        .ok_or_else(|| "Needs key".to_owned())?;
-                    secrets.insert(name, value);
-                }
-                Err(error) => return Err(format!("provider request: {error}")),
-            }
-        };
-        if ta_provider_web::requires_insecure_http_confirmation(&request.url, true) {
-            return Err("refusing non-loopback HTTP provider in console mode".into());
-        }
+        let request = provider_request::map_custom_request(
+            &provider,
+            chunk,
+            (source, target),
+            &params,
+            &mut secrets,
+            ta_platform::credentials::read_secret,
+        )?;
         requests.push(request);
     }
     let secrets: Vec<_> = secrets.into_iter().collect();
@@ -175,8 +171,8 @@ fn run_with_provider(
     ))
 }
 
-fn run(text: &str, context: &str) -> Result<String, String> {
-    let prepared = prepare(text, context)?;
+fn run(text: &str, context: &str, substitutions: &SubstitutionEngine) -> Result<String, String> {
+    let prepared = prepare(text, context, substitutions)?;
     Ok(match prepared {
         PreparedInput::Ready(p) => format!(
             "Original: {}\nProcessed: {}\nStatus: ready",
@@ -268,11 +264,23 @@ fn main() -> ExitCode {
                     s
                 }
             };
-            let result = match (provider, source, target) {
-                (Some(path), Some(source), Some(target)) => {
-                    run_with_provider(&input, &context, Path::new(&path), &source, &target)
+            let substitutions = match substitution_settings::SubstitutionSettings::load() {
+                Ok(settings) => settings.into_engine(),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
                 }
-                _ => run(&input, &context),
+            };
+            let result = match (provider, source, target) {
+                (Some(path), Some(source), Some(target)) => run_with_provider(
+                    &input,
+                    &context,
+                    Path::new(&path),
+                    &source,
+                    &target,
+                    &substitutions,
+                ),
+                _ => run(&input, &context, &substitutions),
             };
             match result {
                 Ok(out) => {
@@ -296,6 +304,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    fn no_substitutions() -> super::SubstitutionEngine {
+        super::SubstitutionEngine::new(false, Vec::new())
+    }
     use super::*;
     #[test]
     fn parses_text_and_stdin_modes() {
@@ -419,7 +430,7 @@ mod tests {
             "[provider]\nid='smoke'\nname='Smoke'\nenabled=true\n[request]\nmethod='POST'\nurl='http://{addr}/translate'\nbody.json={{q='{{{{text}}}}',source='{{{{src}}}}',target='{{{{dst}}}}'}}\n[response]\ntext={{jsonpath='$.translatedText'}}\n"
         );
         fs::write(&path, &definition).unwrap();
-        let result = run_with_provider("hello", "typed", &path, "en", "fr");
+        let result = run_with_provider("hello", "typed", &path, "en", "fr", &no_substitutions());
         fs::remove_file(&path).unwrap();
         server.join().unwrap();
         assert_eq!(
@@ -428,7 +439,7 @@ mod tests {
         );
         let disabled = definition.replace("enabled=true", "enabled=false");
         fs::write(&path, disabled).unwrap();
-        let result = run_with_provider("hello", "typed", &path, "en", "fr");
+        let result = run_with_provider("hello", "typed", &path, "en", "fr", &no_substitutions());
         fs::remove_file(path).unwrap();
         assert!(result.unwrap_err().contains("disabled"));
     }
@@ -450,7 +461,7 @@ mod tests {
         ));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, definition).unwrap();
-        let result = run_with_provider("hello", "typed", &path, "en", "fr");
+        let result = run_with_provider("hello", "typed", &path, "en", "fr", &no_substitutions());
         fs::remove_file(path).unwrap();
         assert!(result.unwrap_err().contains("Needs key"));
     }
@@ -472,7 +483,8 @@ mod tests {
             &path,
             format!("[provider]\nid='manual'\nname='Manual'\nenabled=true\nmax_chars=2\n[request]\nmethod='POST'\nurl='http://{addr}/translate'\nbody.json={{q='{{{{text}}}}'}}\n[response]\ntext={{jsonpath='$.translatedText'}}\n"),
         ).unwrap();
-        let error = run_with_provider("犬。abc", "typed", &path, "ja", "en").unwrap_err();
+        let error = run_with_provider("犬。abc", "typed", &path, "ja", "en", &no_substitutions())
+            .unwrap_err();
         assert!(error.contains("3 characters, limit 2"), "{error}");
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -492,7 +504,7 @@ mod tests {
                 r#"{"translatedText":"Cat."}"#,
             );
         });
-        let output = run_with_provider("犬。猫。", "typed", &path, "ja", "en");
+        let output = run_with_provider("犬。猫。", "typed", &path, "ja", "en", &no_substitutions());
         fs::remove_file(&path).unwrap();
         server.join().unwrap();
         assert!(output.unwrap().contains("Translation: Dog. Cat."));
@@ -501,9 +513,9 @@ mod tests {
     #[test]
     fn runs_deterministic_pipeline_and_reports_skips() {
         assert_eq!(
-            run("hello", "typed").unwrap(),
+            run("hello", "typed", &no_substitutions()).unwrap(),
             "Original: hello\nProcessed: hello\nStatus: ready"
         );
-        assert!(run("   ", "typed").is_err());
+        assert!(run("   ", "typed", &no_substitutions()).is_err());
     }
 }

@@ -4,6 +4,7 @@ use std::{
     net::TcpListener,
     thread,
 };
+use ta_core::{ProviderId, ProviderOutcome, ProviderStatus};
 use ta_platform::SettingsDocument;
 use ta_substitute::SubstitutionRule;
 
@@ -55,12 +56,11 @@ fn clipboard_pipeline_posts_only_eligible_processed_text() {
     assert!(!body.contains("api_key"), "{body}");
     let fetched = pipeline.history.iter().next_back().unwrap();
     let id = fetched.id;
-    assert_eq!(
-        String::from_utf8(output).unwrap(),
-        format!(
-            "Entry: {id}\nContext: clipboard\nOriginal: 猫です\nProcessed: 犬です\nEntry: {id}\nTranslation: It is a dog.\nStatus: ready\n"
-        )
-    );
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.starts_with(&format!(
+        "Entry: {id}\nContext: clipboard\nOriginal: 猫です\nProcessed: 犬です\nEntry: {id}\nProvider: libretranslate\nElapsed: "
+    )));
+    assert!(text.ends_with("Cached: false\nTranslation: It is a dog.\nStatus: ready\n"));
     assert_eq!(fetched.original_text, "猫です");
     assert_eq!(fetched.processed_text, "犬です");
     let provider_id = ta_core::ProviderId::new("libretranslate").unwrap();
@@ -124,6 +124,7 @@ fn accept_request(listener: &TcpListener) -> (std::net::TcpStream, String) {
             Err(e) => panic!("no eligible request: {e}"),
         }
     };
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -218,24 +219,23 @@ fn clipboard_reads_settings_and_fails_closed_for_a_missing_key() {
         "こんにちは",
     ));
     let mut output = Vec::new();
-    pipeline.read_key = |name| {
+    pipeline.providers[0].read_key = |name| {
         assert_eq!(name, "libre-key");
         Ok(None)
     };
     pipeline
         .translate(history_id, "こんにちは".into(), &mut output)
         .unwrap();
-    assert_eq!(
-        String::from_utf8(output).unwrap(),
-        format!("Entry: {history_id}\nStatus: LibreTranslate needs key\n")
-    );
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.starts_with(&format!("Entry: {history_id}\nProvider: libretranslate\n")));
+    assert!(text.ends_with("Status: LibreTranslate needs key\n"));
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
     let reply = mock_reply(&listener, r#"{"error":"Rejected canary-api-key"}"#);
     let mut output = Vec::new();
-    pipeline.read_key = |_| Ok(Some("canary-api-key".into()));
+    pipeline.providers[0].read_key = |_| Ok(Some("canary-api-key".into()));
     pipeline
         .translate(history_id, "こんにちは".into(), &mut output)
         .unwrap();
@@ -276,7 +276,14 @@ fn settings_control_the_automatic_cap_and_cache() {
     pipeline
         .handle_change(1, Some("猫𠮷犬"), &mut output)
         .unwrap();
-    assert_eq!(pipeline.provider.definition().provider.timeout_seconds, 2);
+    assert_eq!(
+        pipeline.providers[0]
+            .provider
+            .definition()
+            .provider
+            .timeout_seconds,
+        2
+    );
     assert!(
         String::from_utf8(output)
             .unwrap()
@@ -300,7 +307,7 @@ fn settings_control_the_automatic_cap_and_cache() {
                 .ends_with("Status: ready\n")
         );
     }
-    assert!(pipeline.cache.is_empty());
+    assert!(pipeline.providers[0].cache.is_empty());
 }
 
 #[test]
@@ -451,7 +458,7 @@ fn newer_text_interrupts_a_retry_after_wait() {
 
 fn drain(pipeline: &mut ClipboardPipeline, output: &mut Vec<u8>) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while pipeline.active.is_some() {
+    while pipeline.has_active_request() {
         pipeline.poll_completion(output).unwrap();
         assert!(Instant::now() < deadline, "provider did not finish");
         thread::sleep(Duration::from_millis(5));
@@ -595,7 +602,7 @@ fn without_a_provider_the_console_stores_original_text_and_offers_setup() {
     pipeline
         .handle_change(1, Some("こんにちは"), &mut output)
         .unwrap();
-    assert!(pipeline.active.is_none());
+    assert!(!pipeline.has_active_request());
     assert_eq!(
         pipeline.history.iter().next().unwrap().original_text,
         "こんにちは"
@@ -685,7 +692,7 @@ max_input_chars = 24
         pipeline.history.iter().next().unwrap().processed_text,
         "こんに"
     );
-    assert!(pipeline.active.is_none());
+    assert!(!pipeline.has_active_request());
     pipeline
         .handle_change_at(3, Some(&"𠮷".repeat(25)), 70, &mut output)
         .unwrap();
@@ -693,5 +700,159 @@ max_input_chars = 24
         String::from_utf8(output)
             .unwrap()
             .contains("25 characters, limit 24")
+    );
+}
+
+#[test]
+fn configured_providers_run_concurrently_and_manual_all_includes_nonautomatic_provider() {
+    let dir = std::env::temp_dir().join(format!(
+        "ta-clipboard-providers-{}-{}",
+        std::process::id(),
+        HistoryEntryId::new(),
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    struct RemoveTestDirectory(std::path::PathBuf);
+    impl Drop for RemoveTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveTestDirectory(dir.clone());
+
+    let providers = ["slow", "fast-a", "fast-b", "manual-only", "disabled"];
+    let listeners = providers.map(|id| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let enabled = id != "disabled";
+        let automatic = id != "manual-only";
+        std::fs::write(
+            dir.join(format!("{id}.toml")),
+            format!(
+                r#"[provider]
+id = "{id}"
+name = "{id}"
+enabled = {enabled}
+auto_translate = {automatic}
+timeout_seconds = 4
+[request]
+method = "POST"
+url = "http://{address}/translate"
+body.json = {{ q = "{{{{text}}}}" }}
+[response]
+text = {{ jsonpath = "$.translatedText" }}
+"#,
+            ),
+        )
+        .unwrap();
+        listener
+    });
+
+    let mut pipeline = ClipboardPipeline::new(ClipboardOptions {
+        endpoint: Endpoint::default(),
+        source: "ja".into(),
+        target: "en".into(),
+        japanese_only: false,
+        rules: Vec::new(),
+    });
+    pipeline.load_providers(&dir);
+    let mut output = Vec::new();
+    pipeline
+        .handle_change(1, Some("並列確認"), &mut output)
+        .unwrap();
+    let (mut slow, body) = accept_request(&listeners[0]);
+    assert!(body.contains("並列確認"));
+    expect_request_and_reply(&listeners[1], "並列確認", r#"{"translatedText":"fast A"}"#);
+    expect_request_and_reply(&listeners[2], "並列確認", r#"{"translatedText":"fast B"}"#);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !(String::from_utf8_lossy(&output).contains("Translation: fast A")
+        && String::from_utf8_lossy(&output).contains("Translation: fast B"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "fast providers were held by the slow provider"
+        );
+        pipeline.poll_completion(&mut output).unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!String::from_utf8_lossy(&output).contains("Translation: slow"));
+    for listener in &listeners[3..] {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    respond(&mut slow, r#"{"translatedText":"slow"}"#);
+    drain(&mut pipeline, &mut output);
+    let entry = pipeline.history.iter().next_back().unwrap();
+    assert_eq!(entry.providers.len(), 3);
+    for id in &providers[..3] {
+        let result = &entry.providers[&ProviderId::new(*id).unwrap()];
+        assert_eq!(result.status, ProviderStatus::Succeeded);
+        assert!(!result.cached);
+        assert!(result.elapsed > Duration::ZERO);
+    }
+    let console = String::from_utf8_lossy(&output);
+    assert!(console.contains("Provider: fast-a\nElapsed: "));
+    assert!(console.contains("Cached: false\nTranslation: fast A\nStatus: ready"));
+
+    pipeline.pause(&mut output).unwrap();
+    let (commands, receiver) = mpsc::channel();
+    commands.send("translate-all".into()).unwrap();
+    assert!(!pipeline.process_commands(&receiver, &mut output).unwrap());
+    for listener in &listeners[..4] {
+        expect_request_and_reply(listener, "並列確認", r#"{"translatedText":"manual run"}"#);
+    }
+    drain(&mut pipeline, &mut output);
+    assert_eq!(
+        listeners[4].accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        pipeline.history.iter().next_back().unwrap().providers.len(),
+        4
+    );
+}
+
+#[test]
+fn automatic_custom_provider_does_not_send_clipboard_text_off_device() {
+    let mut pipeline = ClipboardPipeline::new(ClipboardOptions {
+        endpoint: Endpoint::default(),
+        source: "ja".into(),
+        target: "en".into(),
+        japanese_only: false,
+        rules: Vec::new(),
+    });
+    let definition = ProviderDefinition::from_toml(
+        r#"
+[provider]
+id = "off-device"
+name = "Off-device test"
+enabled = true
+auto_translate = true
+timeout_seconds = 1
+[request]
+method = "POST"
+url = "https://provider.invalid/translate"
+body.json = { q = "{{text}}" }
+[response]
+text = { jsonpath = "$.translatedText" }
+"#,
+    )
+    .unwrap();
+    pipeline
+        .providers
+        .push(ClipboardProvider::custom(definition, "ja", "en"));
+    let mut output = Vec::new();
+    pipeline
+        .handle_change(1, Some("確認"), &mut output)
+        .unwrap();
+    drain(&mut pipeline, &mut output);
+    let entry = pipeline.history.iter().next_back().unwrap();
+    let result = &entry.providers[&ProviderId::new("off-device").unwrap()];
+    assert_eq!(result.status, ProviderStatus::Failed);
+    assert_eq!(
+        result.outcome,
+        ProviderOutcome::Error("automatic sending requires a loopback endpoint".into()),
     );
 }

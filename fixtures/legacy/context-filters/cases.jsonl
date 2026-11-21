@@ -1,0 +1,16 @@
+{"id":"ctx-repeat-none","input":"ここんんににちちはは","settings":{"repeat_characters":"none"},"output":"ここんんににちちはは"}
+{"id":"ctx-repeat-preset","input":"ここんんににちちはは","settings":{"repeat_characters":"preset_2"},"output":"こんにちは"}
+{"id":"ctx-repeat-constant","input":"ああいいいうう","settings":{"repeat_characters":"auto_constant"},"output":"あいう","criterion":"IN-08.2","rewrite_output":"ああいいいうう"}
+{"id":"ctx-repeat-constant-even","input":"たたたちちちつつつ","settings":{"repeat_characters":"auto_constant"},"output":"たちつ"}
+{"id":"ctx-repeat-variable","input":"かかきききくく","settings":{"repeat_characters":"auto_variable"},"output":"かきく"}
+{"id":"ctx-repeat-all","input":"ささしししす","settings":{"repeat_characters":"all"},"output":"さしす"}
+{"id":"ctx-japanese-only-romaji","input":"konnichiwa","settings":{"japanese_only":true,"auto_romaji_to_hiragana":true},"output":null}
+{"id":"ctx-line-breaks-keep-some","input":"一行\n二行\n三行\n四行","settings":{"line_breaks":{"mode":"keep_some","first":1,"last":0}},"output":"一行二行三行四行","criterion":"IN-09.3","rewrite_output":"一行\n二行三行四行"}
+{"id":"ctx-phrase-repeat","input":"はいはいはい","settings":{"phrase_repeat":{"min":2,"max":40}},"output":"はいはいはい","criterion":"IN-08.4","rewrite_output":"はい"}
+{"id":"ctx-line-breaks-remove","input":"一行\n二行\n三行\n四行","settings":{"line_breaks":"remove"},"output":"一行二行三行四行"}
+{"id":"ctx-phrase-repeat-long","input":"おはようございますねおはようございますねおはようございますね","settings":{"phrase_repeat":{"min":2,"max":40}},"output":"おはようございますね"}
+{"id":"ctx-line-breaks-keep-some-next","input":"朝一\n朝二\n朝三\n朝四","settings":{"line_breaks":{"mode":"keep_some","first":1,"last":0}},"output":"朝一朝二朝三朝四","criterion":"IN-09.3","rewrite_output":"朝一\n朝二朝三朝四"}
+{"id":"ctx-phrase-extension","input":["こ","こん","こんに","こんにちは"],"settings":{"phrase_extensions":"basic","spacing_ms":40},"output":"こんにちは"}
+{"id":"ctx-detect-loop","input":["甲文","乙文","丙文","甲文","乙文","丙文","甲文","乙文","丙文","甲文","乙文","丙文","別文"],"settings":{"detect_loops":true},"output":["甲文","乙文","丙文","甲文","乙文","丙文","甲文","乙文","丙文","甲文","乙文","丙文","別文"],"criterion":"IN-08.5","rewrite_output":["甲文","乙文","丙文","丙文","丙文","丙文","丙文","丙文","丙文","丙文","丙文","丙文","別文"]}
+{"id":"ctx-merge-stream","input":[["FixtureA","左側"],["FixtureB","右側"]],"settings":{"merge_stream":true,"spacing_ms":40},"output":["左側右側"]}
+{"id":"ctx-merge-on-flush","input":[["FixtureA","左側"],["FixtureB","右側"]],"settings":{"merge_on_flush":true,"spacing_ms":40},"output":[],"criterion":"IN-06.4","rewrite_output":["左側右側"]}

@@ -1,36 +1,22 @@
 use std::{
-    collections::BTreeMap,
     io::{self, BufRead, Write},
     path::Path,
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, SyncSender},
-    },
-    thread::{self, JoinHandle},
+    sync::mpsc::{self, Receiver},
+    thread,
     time::{Duration, Instant},
 };
-use ta_core::{
-    ContextId, DEFAULT_MAX_INPUT_CHARS, History, HistoryEntryId, ProviderHistory, ProviderId,
-    ProviderOutcome, ProviderStatus, TextInput,
-};
+use ta_core::{ContextId, DEFAULT_MAX_INPUT_CHARS, History, HistoryEntryId, TextInput};
 use ta_ingest::{
     ClipboardGate, FlushedText, InputBuffer, PipelineOptions, PipelineTransforms, PreparedInput,
     SkipReason, TextFilter, prepare_input,
 };
 use ta_platform::{
     clipboard::{ClipboardListener, clipboard_sequence_number, read_clipboard_change},
-    credentials::read_secret,
     load_settings, settings_paths,
 };
-use ta_provider_web::{
-    ProviderError, ValidatedProvider, libretranslate_preset, libretranslate_request, redact_secrets,
-};
-use ta_substitute::{SubstitutionEngine, SubstitutionProfile};
-use ta_translate::{
-    ProviderQueue, QueueAction, RequestMode, RequestRejection, ResultCache, ResultCacheKey,
-    RoutingRejection, RoutingRequest, TranslatorCapabilities, TranslatorKind,
-    routing_request_rejection,
-};
+use ta_provider_web::ProviderDefinition;
+use ta_substitute::SubstitutionEngine;
+use ta_translate::RequestMode;
 
 const CONTEXT: &str = "clipboard";
 pub(super) const USAGE: &str = "       translation-aggregator --clipboard --source LANG --target LANG [--libretranslate-server IP:PORT] [--japanese-only] [--substitute MATCH REPLACEMENT]";
@@ -39,24 +25,12 @@ mod history;
 mod input_settings;
 mod options;
 mod pacing;
+mod provider;
+use crate::substitution_settings::SubstitutionSettings;
 use history::HistoryDisk;
 use input_settings::InputSettings;
 use options::{ClipboardOptions, Endpoint};
-use pacing::{ProviderPacing, send_with_retries};
-
-struct TranslationJob {
-    id: HistoryEntryId,
-    text: String,
-}
-
-struct ActiveRequest {
-    id: HistoryEntryId,
-    started: Instant,
-    cache_key: Option<ResultCacheKey>,
-    worker: JoinHandle<Result<Option<String>, String>>,
-    stop_retries: SyncSender<()>,
-    waits: Receiver<Duration>,
-}
+use provider::ClipboardProvider;
 
 struct ClipboardPipeline {
     gate: ClipboardGate,
@@ -66,53 +40,34 @@ struct ClipboardPipeline {
     history: History,
     history_disk: Option<HistoryDisk>,
     history_dirty: bool,
-    cache: ResultCache,
-    cache_enabled: bool,
     options: PipelineOptions,
     auto_translate: bool,
     max_input_chars: usize,
-    provider: ValidatedProvider,
-    provider_enabled: bool,
-    params: BTreeMap<String, String>,
-    capabilities: TranslatorCapabilities,
-    credential: Option<String>,
-    read_key: fn(&str) -> io::Result<Option<String>>,
-    queue: ProviderQueue<TranslationJob>,
-    active: Option<ActiveRequest>,
-    pacing: Arc<Mutex<ProviderPacing>>,
+    providers: Vec<ClipboardProvider>,
     source: String,
     target: String,
     started: Instant,
 }
 
 impl ClipboardPipeline {
+    #[cfg(test)]
     fn new(options: ClipboardOptions) -> Self {
-        let mut provider = libretranslate_preset();
-        if let Some(timeout) = options.endpoint.timeout_seconds {
-            provider = provider.with_timeout_seconds(timeout);
-        }
-        let configured = &provider.definition().provider;
-        let mut capabilities = TranslatorCapabilities::new(TranslatorKind::Remote);
-        capabilities.id = configured.id.clone();
-        capabilities.name = configured.name.clone();
-        capabilities.remote = false;
-        capabilities.detects_source_language = true;
-        capabilities.max_chars = Some(configured.max_chars.min(options.endpoint.auto_max_chars));
+        Self::with_substitutions(options, SubstitutionSettings::default())
+    }
 
+    fn with_substitutions(options: ClipboardOptions, substitutions: SubstitutionSettings) -> Self {
+        let preset =
+            ClipboardProvider::libretranslate(options.endpoint, &options.source, &options.target);
         Self {
             gate: ClipboardGate::new(),
             buffer: InputBuffer::new(),
             filter: TextFilter::new(),
-            substitutions: SubstitutionEngine::new(
-                !options.rules.is_empty(),
-                vec![SubstitutionProfile::new(CONTEXT).with_rules(options.rules)],
-            ),
+            substitutions: substitutions
+                .with_rules(CONTEXT, options.rules)
+                .into_engine(),
             history: History::default(),
             history_disk: None,
             history_dirty: false,
-            cache: ResultCache::new(),
-            // The configured credential can change independently of the settings file.
-            cache_enabled: options.endpoint.cache && options.endpoint.credential.is_none(),
             options: PipelineOptions {
                 japanese_only: options.japanese_only,
                 suppress_repeats: true,
@@ -120,24 +75,41 @@ impl ClipboardPipeline {
             },
             auto_translate: true,
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
-            provider,
-            provider_enabled: options.endpoint.server.is_some(),
-            params: options
-                .endpoint
-                .server
-                .map(|server| ("server".into(), format!("http://{server}")))
-                .into_iter()
-                .collect(),
-            capabilities,
-            credential: options.endpoint.credential,
-            read_key: read_secret,
-            queue: ProviderQueue::new(),
-            active: None,
-            pacing: Arc::new(Mutex::new(ProviderPacing::new(options.endpoint.rate_limit))),
+            providers: vec![preset],
             source: options.source,
             target: options.target,
             started: Instant::now(),
         }
+    }
+
+    fn load_providers(&mut self, path: &Path) {
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("providers folder: {error}");
+                return;
+            }
+        }
+        let report = ProviderDefinition::load_folder(path);
+        for error in report.errors {
+            eprintln!("provider: {error}");
+        }
+        for provider in report.providers {
+            if provider.definition().provider.id == "libretranslate" {
+                eprintln!("provider: libretranslate is reserved for the built-in preset");
+                continue;
+            }
+            self.providers.push(ClipboardProvider::custom(
+                provider,
+                &self.source,
+                &self.target,
+            ));
+        }
+    }
+
+    fn has_active_request(&self) -> bool {
+        self.providers.iter().any(ClipboardProvider::is_active)
     }
 
     fn handle_change(
@@ -268,238 +240,59 @@ impl ClipboardPipeline {
         text: String,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        let rejection = routing_request_rejection(RoutingRequest {
-            capabilities: &self.capabilities,
-            provider_enabled: self.provider_enabled,
-            credentials_available: true,
-            remote_permission: false,
-            auto_translate_enabled: self.auto_translate,
-            source: &self.source,
-            target: &self.target,
-            text: &text,
-            mode: RequestMode::Automatic,
-        });
-        match rejection {
-            Some(RoutingRejection::ProviderDisabled) => {
-                return writeln!(output, "Entry: {id}\nStatus: Add a translator");
-            }
-            Some(RoutingRejection::AutoTranslateDisabled) => {
-                return writeln!(output, "Entry: {id}\nStatus: Automatic translation is off");
-            }
-            Some(RoutingRejection::Provider(RequestRejection::TooLong {
-                actual_chars,
-                max_chars,
-            })) => {
-                return writeln!(
-                    output,
-                    "Entry: {id}\nStatus: skipped (Too long for automatic translation ({actual_chars} characters, limit {max_chars}))"
-                );
-            }
-            Some(reason) => return writeln!(output, "Entry: {id}\nStatus: skipped ({reason:?})"),
-            None => {}
-        }
-        if let Some(active) = &self.active {
-            let _ = active.stop_retries.try_send(());
-        }
-        match self.queue.submit(TranslationJob { id, text }) {
-            QueueAction::Start(job) => self.start(job, output),
-            QueueAction::Queued => Ok(()),
-            QueueAction::Replaced(job) => {
-                self.report_skipped(job.id, "newer clipboard input", output)
-            }
-        }
+        self.route(id, &text, RequestMode::Automatic, output)
     }
 
-    fn start(&mut self, job: TranslationJob, output: &mut impl Write) -> io::Result<()> {
-        self.start_request(job, output)?;
-        if self.active.is_none() {
-            let next = self.queue.complete();
-            debug_assert!(next.is_none(), "a fresh start cannot have queued work");
+    fn route(
+        &mut self,
+        id: HistoryEntryId,
+        text: &str,
+        mode: RequestMode,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
+        if !self.providers.iter().any(|provider| provider.enabled) {
+            return writeln!(output, "Entry: {id}\nStatus: Add a translator");
+        }
+        if mode == RequestMode::Automatic && !self.auto_translate {
+            return writeln!(output, "Entry: {id}\nStatus: Automatic translation is off");
+        }
+        self.history_dirty = true;
+        for provider in &mut self.providers {
+            provider.translate(id, text, mode, &mut self.history, output)?;
         }
         Ok(())
-    }
-
-    fn start_request(&mut self, job: TranslationJob, output: &mut impl Write) -> io::Result<()> {
-        let TranslationJob { id, text } = job;
-        let started = Instant::now();
-        let cache_key = self.cache_enabled.then(|| ResultCacheKey {
-            provider_id: self.capabilities.id.clone(),
-            processed_text: text.clone(),
-            source: self.source.clone(),
-            target: self.target.clone(),
-            settings_fingerprint: self.params["server"].clone(),
-        });
-        if let Some(cached) = cache_key
-            .as_ref()
-            .and_then(|key| self.cache.get(key, true))
-            .map(str::to_owned)
-        {
-            return self.report_completion(&id, Ok(cached), started.elapsed(), true, output);
-        }
-
-        let secrets = match self.credential.as_deref() {
-            Some(name) => match (self.read_key)(name) {
-                Ok(Some(key)) => vec![(name.to_owned(), key)],
-                Ok(None) => {
-                    return self.report_completion(
-                        &id,
-                        Err("needs key".into()),
-                        started.elapsed(),
-                        false,
-                        output,
-                    );
-                }
-                Err(_) => {
-                    return self.report_completion(
-                        &id,
-                        Err("needs key (credential store unavailable)".into()),
-                        started.elapsed(),
-                        false,
-                        output,
-                    );
-                }
-            },
-            None => Vec::new(),
-        };
-        let request = libretranslate_request(
-            &self.provider,
-            &text,
-            &self.source,
-            &self.target,
-            &self.params,
-            secrets.first().map(|(_, key)| key.as_str()),
-        );
-        let provider = self.provider.clone();
-        let (stop_retries, newer_entry) = mpsc::sync_channel(1);
-        let (wait_tx, waits) = mpsc::channel();
-        let pacing = Arc::clone(&self.pacing);
-        let jitter_seed = self.started.elapsed().as_nanos() as u64;
-        let worker = thread::Builder::new()
-            .name("libretranslate".into())
-            .spawn(move || {
-                request
-                    .and_then(|request| {
-                        send_with_retries(
-                            &provider,
-                            &request,
-                            &newer_entry,
-                            &pacing,
-                            &wait_tx,
-                            jitter_seed,
-                        )
-                    })
-                    .map(|translation| translation.map(|text| redact_secrets(&text, &secrets)))
-                    .map_err(|error| match error {
-                        ProviderError::Timeout => format!(
-                            "timed out after {} s",
-                            provider.definition().provider.timeout_seconds
-                        ),
-                        _ => format!("error ({})", redact_secrets(&error.to_string(), &secrets)),
-                    })
-            });
-        match worker {
-            Ok(worker) => {
-                self.active = Some(ActiveRequest {
-                    id,
-                    started,
-                    cache_key,
-                    worker,
-                    stop_retries,
-                    waits,
-                });
-                Ok(())
-            }
-            Err(_) => self.report_completion(
-                &id,
-                Err("error (could not start worker)".into()),
-                started.elapsed(),
-                false,
-                output,
-            ),
-        }
     }
 
     fn poll_completion(&mut self, output: &mut impl Write) -> io::Result<()> {
-        if let Some(active) = &self.active {
-            for delay in active.waits.try_iter() {
-                let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
-                writeln!(
-                    output,
-                    "Entry: {}\nStatus: Waiting {seconds}s (rate limit)",
-                    active.id
-                )?;
-            }
-        }
-        if !self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.worker.is_finished())
-        {
-            return Ok(());
-        }
-        let ActiveRequest {
-            id,
-            started,
-            cache_key,
-            worker,
-            stop_retries: _,
-            waits: _,
-        } = self.active.take().expect("completed request");
-        let result = worker
-            .join()
-            .unwrap_or_else(|_| Err("error (worker stopped)".into()));
-        if let (Some(key), Ok(Some(translation))) = (cache_key, &result) {
-            self.cache.insert_success(key, translation.clone(), true);
-        }
-        match result {
-            Ok(None) => self.report_skipped(id, "automatic request withdrawn", output)?,
-            Ok(Some(translation)) => {
-                self.report_completion(&id, Ok(translation), started.elapsed(), false, output)?
-            }
-            Err(error) => {
-                self.report_completion(&id, Err(error), started.elapsed(), false, output)?
-            }
-        }
-        if let Some(next) = self.queue.complete() {
-            self.start(next, output)?;
+        for provider in &mut self.providers {
+            self.history_dirty |= provider.poll_completion(&mut self.history, output)?;
         }
         Ok(())
-    }
-
-    fn provider_id(&self) -> ProviderId {
-        ProviderId::new(self.capabilities.id.as_str()).expect("preset has an ID")
-    }
-
-    fn report_skipped(
-        &mut self,
-        id: HistoryEntryId,
-        reason: &str,
-        output: &mut impl Write,
-    ) -> io::Result<()> {
-        self.history_dirty = true;
-        self.history.record_provider(
-            &id,
-            self.provider_id(),
-            ProviderHistory {
-                outcome: ProviderOutcome::Skipped,
-                status: ProviderStatus::Skipped,
-                elapsed: Duration::ZERO,
-                cached: false,
-            },
-        );
-        writeln!(output, "Entry: {id}\nStatus: skipped ({reason})")
     }
 
     fn pause(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.gate.pause();
         self.buffer.discard_pending(CONTEXT);
-        if let Some(active) = &self.active {
-            let _ = active.stop_retries.try_send(());
-        }
-        if let Some(job) = self.queue.discard_pending() {
-            self.report_skipped(job.id, "automatic input paused", output)?;
+        self.history_dirty = true;
+        for provider in &mut self.providers {
+            provider.pause(&mut self.history, output)?;
         }
         writeln!(output, "Clipboard capture paused.")
+    }
+
+    fn translate_all(&mut self, output: &mut impl Write) -> io::Result<()> {
+        let Some((id, text)) = self
+            .history
+            .iter()
+            .next_back()
+            .map(|entry| (entry.id, entry.processed_text.clone()))
+        else {
+            return writeln!(output, "Status: No captured text to translate");
+        };
+        if text.is_empty() {
+            return writeln!(output, "Status: No captured text to translate");
+        }
+        self.route(id, &text, RequestMode::Manual, output)
     }
 
     fn process_commands(
@@ -517,60 +310,13 @@ impl ClipboardPipeline {
                     }
                     Err(error) => writeln!(output, "Could not resume clipboard capture: {error}")?,
                 },
+                "translate-all" => self.translate_all(output)?,
                 "quit" => return Ok(true),
                 "" => {}
-                _ => writeln!(output, "Commands: pause, resume, quit")?,
+                _ => writeln!(output, "Commands: pause, resume, translate-all, quit")?,
             }
         }
         Ok(false)
-    }
-
-    fn report_completion(
-        &mut self,
-        history_id: &HistoryEntryId,
-        result: Result<String, String>,
-        elapsed: Duration,
-        cached: bool,
-        output: &mut impl Write,
-    ) -> io::Result<()> {
-        let provider = self.provider_id();
-        let (outcome, status, display) = match result {
-            Ok(translation) => {
-                let state = if cached { "cached" } else { "ready" };
-                let display = writeln!(
-                    output,
-                    "Entry: {history_id}\nTranslation: {translation}\nStatus: {state}"
-                );
-                (
-                    ProviderOutcome::Result(translation),
-                    ProviderStatus::Succeeded,
-                    display,
-                )
-            }
-            Err(error) => {
-                let display = writeln!(
-                    output,
-                    "Entry: {history_id}\nStatus: LibreTranslate {error}"
-                );
-                (
-                    ProviderOutcome::Error(error),
-                    ProviderStatus::Failed,
-                    display,
-                )
-            }
-        };
-        self.history.record_provider(
-            history_id,
-            provider,
-            ProviderHistory {
-                outcome,
-                status,
-                elapsed,
-                cached,
-            },
-        );
-        self.history_dirty = true;
-        display
     }
 
     fn open_history(&mut self, dir: &Path, keep: bool) -> io::Result<()> {
@@ -594,7 +340,9 @@ impl ClipboardPipeline {
 
 pub(super) fn run(args: &[String]) -> Result<(), String> {
     let mut history_settings = None;
+    let mut providers_folder = None;
     let mut input_settings = InputSettings::default();
+    let mut substitutions = SubstitutionSettings::default();
     let options = ClipboardOptions::parse(args, || {
         let paths = settings_paths().map_err(|error| format!("settings path: {error}"))?;
         let settings =
@@ -611,12 +359,20 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             })
             .transpose()?
             .unwrap_or(false);
+        providers_folder = paths
+            .settings_file
+            .parent()
+            .map(|dir| dir.join("providers"));
         history_settings = Some((paths.data_dir, keep_history));
         input_settings = InputSettings::from_document(&settings.document)?;
+        substitutions = SubstitutionSettings::from_document(&settings.document)?;
         Endpoint::from_settings(&settings.document)
     })
     .map_err(|error| format!("{error}\n{USAGE}"))?;
-    let mut pipeline = ClipboardPipeline::new(options);
+    let mut pipeline = ClipboardPipeline::with_substitutions(options, substitutions);
+    if let Some(path) = providers_folder {
+        pipeline.load_providers(&path);
+    }
     let capture_enabled = input_settings.buffer.enabled;
     pipeline.configure_input(input_settings);
     if let Some((dir, keep)) = history_settings
@@ -661,7 +417,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         if let Err(error) = pipeline.flush_history() {
             eprintln!("history storage unavailable: {error}");
         }
-        let mut timeout = if pipeline.active.is_some() {
+        let mut timeout = if pipeline.has_active_request() {
             Duration::from_millis(10)
         } else {
             Duration::from_millis(100)

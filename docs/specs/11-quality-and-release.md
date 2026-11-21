@@ -86,6 +86,10 @@ Windows 10 22H2 or Windows 11, one 1920×1080 screen at 100 % or 150 % scale, in
 Both the 32-bit and the 64-bit build must meet the numbers on it. Times are measured warm (not the
 first start after boot) unless stated otherwise.
 
+On 2026-11-21, the owner approved the current Windows development PC for the M1 clipboard
+and substitution checks. Its configuration and measurements are recorded in the
+[M1 walkthrough](../walkthroughs/M1-core.md#windows-results-on-2026-11-21).
+
 **Acceptance criteria**
 
 - **NFR-03.1** Given clipboard or local API text arrives, when it is shown, then it appears in the

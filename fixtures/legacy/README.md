@@ -68,5 +68,6 @@ stable: tests refer to them.
 
 ## Status
 
-No set has been captured yet. Capturing needs a working legacy build; this repository contains
-none (`Old-Codebase/` is source only).
+M1 context-filter and substitution cases are captured from the official Windows x86 v1.0.7 release.
+See [context filters](context-filters/capture.md) and [substitutions](substitutions/capture.md) for
+the capture procedure and observed differences. The other sets above are still pending.

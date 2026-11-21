@@ -949,6 +949,7 @@ dependencies = [
 name = "ta-ingest"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "ta-core",
  "ta-platform",
  "ta-substitute",

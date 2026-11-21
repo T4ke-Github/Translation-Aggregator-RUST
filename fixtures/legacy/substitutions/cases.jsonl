@@ -1,0 +1,6 @@
+{"id":"sub-longest","input":"日本語と日本","settings":{"profile":"*"},"output":"JapaneseとJapan"}
+{"id":"sub-no-rescan","input":"文a","settings":{"profile":"*"},"output":"文b"}
+{"id":"sub-escaped-controls","input":"行\n末","settings":{"profile":"*"},"output":"行\t終"}
+{"id":"sub-escaped-backslash","input":"逆\\斜","settings":{"profile":"*"},"output":"Backslash"}
+{"id":"sub-profile-inactive","input":"初星印","settings":{"profile":"*"},"output":"初星印"}
+{"id":"sub-profile-active","input":"続星印と日本","settings":{"profile":"debug\\translation-aggregator.exe"},"output":"続ScopedとJapan"}

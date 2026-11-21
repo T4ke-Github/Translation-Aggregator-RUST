@@ -2,19 +2,61 @@
 
 The Rust rewrite is in M1, not at the M1 exit gate. M0 scaffolding and several M1 slices are merged into `main`. CI builds and tests both Windows MSVC widths, but a passing CI run does not prove every acceptance criterion. Use the [project plan](project-plan.md), [spec index](specs/README.md), and [product direction](product-direction.md) as the source of work and decisions.
 
+## M1 checkpoint on 2026-11-21
+
+- The clipboard console loads configured web providers and runs one active request plus one queued
+  request per provider. Fast results appear independently of slow providers. `translate-all`
+  reaches enabled manual-only providers even while capture is paused. The console and retained
+  history record provider ID, outcome, elapsed time, and cache status.
+- The clipboard and typed-input paths load saved global, exact-context, and wildcard substitution
+  profiles from `settings.toml`. The explicit keyless LibreTranslate override still uses its
+  command-line rules. See the [M1 walkthrough](walkthroughs/M1-core.md) for setup and criterion-level evidence.
+- Both Windows MSVC builds passed 170 workspace tests, strict Clippy, all seven native clipboard
+  smoke cases, three-provider routing with a slow provider timing out, and live Japanese-to-English
+  translation against LibreTranslate 1.9.6 on loopback. The Rust 1.90 workspace check passed.
+- Both builds passed the disposable Credential Manager and history checks. The [legacy fixtures](../fixtures/legacy/README.md)
+  contain 22 captured cases with automated replay and documented behavior differences.
+- The owner approved the previous development PC for M1 performance sign-off. Clipboard latency
+  upper bounds were 0.78 ms on 64-bit and 0.87 ms on 32-bit against the 100 ms budget. Warm
+  substitutions took 13.71 ms and 19.16 ms against the 300 ms budget.
+
+## Resume on another Windows PC
+
+This checkpoint builds on `95f9a1f`. On the next PC, open the `RUST-Rewrite` repository and run
+`git status --short --branch` to check for local edits. Fetch `origin/main` and fast-forward local
+`main` once the M1 checkpoint PR is merged. The checkpoint includes the console source, parity
+tests, and both legacy fixture folders.
+
+Install Visual Studio Build Tools with **Desktop development with C++**, the MSVC x64/x86 tools,
+and a Windows SDK. Run the following from the `RUST-Rewrite` root in PowerShell. The explicit
+toolchain leaves the machine's Rust default alone.
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-msvc
+rustup target add --toolchain stable-x86_64-pc-windows-msvc i686-pc-windows-msvc
+rustup component add --toolchain stable-x86_64-pc-windows-msvc rustfmt clippy
+
+foreach ($target in 'x86_64-pc-windows-msvc', 'i686-pc-windows-msvc') {
+    cargo +stable-x86_64-pc-windows-msvc build --locked -p ta-gui --target $target
+    cargo +stable-x86_64-pc-windows-msvc test --workspace --locked --target $target
+}
+```
+
+The previous builds, Python mocks, and LibreTranslate server used temporary folders on the other
+PC. Recreate the loopback mock or server from the [M1 walkthrough](walkthroughs/M1-core.md) if
+another native run is needed. Use a disposable portable profile for clipboard, Credential Manager,
+and history checks.
+
 ## Next M1 work
 
-The developer console has an opt-in clipboard path through buffering, filters, substitutions, and routing to LibreTranslate over loopback. The server can come from settings with an optional Windows Credential Manager reference, or from an explicit keyless command-line override. The local mock test starts at the clipboard event boundary and checks that rejected input makes no request. Run the [M1 walkthrough](walkthroughs/M1-core.md) on both Windows builds to verify native clipboard delivery and the live-server exit criterion. Remote and paid auto-translation stays off by default, per the approved O10 decision.
-
-The console reuses complete keyless LibreTranslate results and records successful, cached, failed,
-and superseded entries in memory. LibreTranslate runs off the capture thread with one active
-request and one waiting entry. Transient failures get up to two retries, and newer eligible input
-ends the older request's retry wait. The console supports configurable provider pacing, a cooldown
-on HTTP 429, and opt-in history retention. Clipboard settings control idle buffering and filters.
-The console can pause without reading clipboard contents and capture with automatic translation
-off or without a provider. Manual requests split at sentence boundaries before sending any chunks.
-
-Capture Phase-0 black-box fixtures for parity tests without copying legacy source or data. The [fixture guide](../fixtures/legacy/README.md) lists the missing captures. Test the 500-character and 10,000-rule performance target on the stated Windows reference hardware. Record walkthrough results and mark only criteria proved by their required test method in the spec tracker.
+1. Address PIP-05.2. Automatic console sends currently require a loopback endpoint. The one-time
+   confirmation for automatic off-device sends is still open. Keep the O10 default of remote and
+   paid auto-translation off.
+2. Audit the remaining M1 Must criteria against their specified verification methods using the
+   [spec index](specs/README.md) and [project plan](project-plan.md). The walkthrough records the
+   evidence collected so far. The published [spec tracker](../tools/spec-tracker/README.md) is private
+   and was unavailable from the previous session. Its statuses still need to be reconciled with
+   the walkthrough once an editable tracker or export is available.
 
 ## Later gates
 
@@ -28,4 +70,4 @@ licences, docs, and final checks for both Windows widths.
 
 Use one orchestrator and two subagents for each milestone, with exclusive file areas. Write a criterion-level failing test before code, then make it pass and rerun the linked checks. Keep the clean-room split in [CONTRIBUTING.md](../CONTRIBUTING.md); never implement a feature from legacy C++ source. A helper test is not proof that the app calls the helper.
 
-PRs 5 and 6 updated the TOML and Windows dependency versions and are merged. PR 5 needed a parser-location test fix before both Windows widths passed. At this handover there are no open PRs. Check `git status`, fetch `main`, and read the latest CI run before starting the next branch. This note records scope, not a claim that M1 or later gates are complete.
+Review the transferred changes and preserve any pre-existing local edits before branching.
