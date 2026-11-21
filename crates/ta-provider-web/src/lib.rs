@@ -1692,7 +1692,7 @@ error = { jsonpath = "$.error" }
         assert_eq!(report.errors.len(), 2);
         assert_eq!(report.errors[0].path, folder.join("b.toml"));
         assert!(
-            report.errors[0].to_string().contains("line 3, column"),
+            report.errors[0].to_string().contains("line 2, column"),
             "{:?}",
             report.errors
         );
