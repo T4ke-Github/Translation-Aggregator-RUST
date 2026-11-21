@@ -203,6 +203,8 @@ pub struct BufferSettings {
     pub idle_delay_ms: u64,
     /// Optional route into the merged context.
     pub merge: Option<MergeMode>,
+    /// Keep only the last piece when each piece extends the one before.
+    pub phrase_extensions: bool,
 }
 impl Default for BufferSettings {
     fn default() -> Self {
@@ -210,6 +212,7 @@ impl Default for BufferSettings {
             enabled: true,
             idle_delay_ms: 0,
             merge: None,
+            phrase_extensions: false,
         }
     }
 }
@@ -239,6 +242,7 @@ pub struct FlushedText {
 #[derive(Default)]
 struct Pending {
     text: String,
+    pieces: Vec<String>,
     last_at: u64,
 }
 
@@ -292,6 +296,7 @@ impl InputBuffer {
         }
         let pending = self.pending.entry(context.into()).or_default();
         pending.text.push_str(text);
+        pending.pieces.push(text.to_owned());
         pending.last_at = now_ms;
         Vec::new()
     }
@@ -322,13 +327,15 @@ impl InputBuffer {
                 .get(&ctx)
                 .copied()
                 .unwrap_or_else(|| BufferSettings::default_for(&ctx));
-            if ctx != "merged" && cfg.merge == Some(MergeMode::OnFlush) {
-                merged.push_str(&pending.text);
+            let text = if cfg.phrase_extensions {
+                reduce_phrase_extensions(&pending.pieces).unwrap_or(pending.text)
             } else {
-                out.push(FlushedText {
-                    context: ctx,
-                    text: pending.text,
-                });
+                pending.text
+            };
+            if ctx != "merged" && cfg.merge == Some(MergeMode::OnFlush) {
+                merged.push_str(&text);
+            } else {
+                out.push(FlushedText { context: ctx, text });
             }
         }
         if !merged.is_empty() {
@@ -695,6 +702,39 @@ mod tests {
             filter.accept("a", "同じ", false, false, false),
             Some("同じ".into())
         );
+    }
+
+    #[test]
+    fn phrase_extension_flush_keeps_longest_piece_only_when_enabled() {
+        for (pieces, enabled, expected) in [
+            (
+                vec!["こ", "こん", "こんに", "こんにちは"],
+                true,
+                "こんにちは",
+            ),
+            (
+                vec!["こ", "こん", "こんに", "こんにちは"],
+                false,
+                "ここんこんにこんにちは",
+            ),
+            (vec!["こ", "違う"], true, "こ違う"),
+        ] {
+            let mut buffer = InputBuffer::new();
+            buffer.configure(
+                "hook:game",
+                BufferSettings {
+                    idle_delay_ms: 10,
+                    phrase_extensions: enabled,
+                    ..Default::default()
+                },
+            );
+            for (index, piece) in pieces.iter().enumerate() {
+                assert!(buffer.push("hook:game", piece, index as u64).is_empty());
+            }
+            let last_at = pieces.len() as u64 - 1;
+            assert_eq!(buffer.flush_due(last_at + 9), Vec::<FlushedText>::new());
+            assert_eq!(buffer.flush_due(last_at + 10)[0].text, expected);
+        }
     }
 
     #[test]
