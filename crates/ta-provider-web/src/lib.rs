@@ -1473,6 +1473,36 @@ pub fn is_loopback_url(url: &str) -> bool {
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && is_loopback(&url))
 }
 
+/// Canonical HTTPS scheme, host, and port for comparing an outgoing request to user consent.
+pub fn automatic_https_origin(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url).ok()?;
+    if url.scheme() != "https"
+        || !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port() == Some(0)
+    {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+/// Return the consent origin only if the HTTPS authority is fixed before any text is mapped.
+pub fn automatic_https_origin_from_template(template: &str) -> Option<String> {
+    let (scheme, authority_and_path) = template.split_once("://")?;
+    let authority = authority_and_path.split(['/', '?', '#']).next()?;
+    if !scheme.eq_ignore_ascii_case("https")
+        || authority.contains(['{', '}', '\\', '@'])
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let authority_end = scheme.len() + "://".len() + authority.len();
+    automatic_https_origin(&template[..authority_end])
+}
+
 fn is_loopback(url: &reqwest::Url) -> bool {
     url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
@@ -1538,6 +1568,62 @@ pub fn libretranslate_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_https_origin_only_exposes_the_normalized_https_authority() {
+        assert_eq!(
+            automatic_https_origin("HTTPS://Example.TEST:443/path/private?key=secret#fragment")
+                .as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(
+            automatic_https_origin("https://[0:0:0:0:0:0:0:1]:8443/translate").as_deref(),
+            Some("https://[::1]:8443")
+        );
+        for url in [
+            "http://example.test/translate",
+            "ftp://example.test/translate",
+            "https://user:secret@example.test/translate",
+            "https://:secret@example.test/translate",
+            "https://example.test:0/translate",
+            "https://",
+            "not a URL",
+        ] {
+            assert_eq!(automatic_https_origin(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn automatic_https_template_requires_a_fixed_origin() {
+        assert_eq!(
+            automatic_https_origin_from_template(
+                "HTTPS://Example.TEST:8443/translate/{{text}}?token={{secret.key}}"
+            )
+            .as_deref(),
+            Some("https://example.test:8443")
+        );
+        assert_eq!(
+            automatic_https_origin_from_template("https://example.test?q={{text}}").as_deref(),
+            Some("https://example.test")
+        );
+        for template in [
+            "{{param.server}}/translate",
+            "https://{{text}}.example.test/translate",
+            "https://example.test:{{param.port}}/translate",
+            "https://example.test\\{{text}}/translate",
+            "https://example.test @other.test/translate",
+            "https://@example.test/translate",
+            "https:///example.test/translate",
+            "https:example.test/translate",
+            "http://example.test/translate",
+        ] {
+            assert_eq!(
+                automatic_https_origin_from_template(template),
+                None,
+                "{template}"
+            );
+        }
+    }
 
     #[test]
     fn retry_after_accepts_delay_seconds_and_http_dates() {

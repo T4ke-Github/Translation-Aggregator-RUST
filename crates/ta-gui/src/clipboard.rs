@@ -1,5 +1,5 @@
 use std::{
-    io::{self, BufRead, Write},
+    io::{self, BufRead, IsTerminal, Write},
     path::Path,
     sync::mpsc::{self, Receiver},
     thread,
@@ -21,6 +21,7 @@ use ta_translate::RequestMode;
 const CONTEXT: &str = "clipboard";
 pub(super) const USAGE: &str = "       translation-aggregator --clipboard --source LANG --target LANG [--libretranslate-server IP:PORT] [--japanese-only] [--substitute MATCH REPLACEMENT]";
 
+mod consent;
 mod history;
 mod input_settings;
 mod options;
@@ -375,10 +376,26 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
     }
     let capture_enabled = input_settings.buffer.enabled;
     pipeline.configure_input(input_settings);
-    if let Some((dir, keep)) = history_settings
-        && let Err(error) = pipeline.open_history(&dir, keep)
+    if let Some((dir, keep)) = &history_settings
+        && let Err(error) = pipeline.open_history(dir, *keep)
     {
         eprintln!("history storage unavailable: {error}");
+    }
+    if let Some((dir, _)) = history_settings {
+        let input = io::stdin();
+        let output = io::stdout();
+        let can_prompt = capture_enabled
+            && pipeline.auto_translate
+            && input.is_terminal()
+            && output.is_terminal();
+        if let Err(error) = consent::configure(&mut pipeline.providers, &dir, |name, id, origin| {
+            if !can_prompt {
+                return Ok(false);
+            }
+            consent::prompt(&mut input.lock(), &mut output.lock(), name, id, origin)
+        }) {
+            eprintln!("Automatic off-device translation is off: {error}");
+        }
     }
     if !capture_enabled {
         println!("Clipboard capture is disabled in settings.");

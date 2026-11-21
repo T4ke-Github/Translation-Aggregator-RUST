@@ -13,8 +13,8 @@ use ta_core::{
 };
 use ta_platform::credentials::read_secret;
 use ta_provider_web::{
-    ProviderError, ValidatedProvider, is_loopback_url, libretranslate_preset,
-    libretranslate_request, redact_secrets,
+    ProviderError, ValidatedProvider, automatic_https_origin, automatic_https_origin_from_template,
+    is_loopback_url, libretranslate_preset, libretranslate_request, redact_secrets,
 };
 use ta_translate::{
     ProviderQueue, QueueAction, RequestMode, RequestRejection, ResultCache, ResultCacheKey,
@@ -48,6 +48,8 @@ pub(super) struct ClipboardProvider {
     pub(super) provider: ValidatedProvider,
     pub(super) enabled: bool,
     automatic: bool,
+    configured_origin: Option<String>,
+    pub(super) approved_origin: Option<String>,
     capabilities: TranslatorCapabilities,
     // Only the keyless built-in preset caches results. Credentials can rotate independently.
     local_endpoint: Option<String>,
@@ -90,6 +92,10 @@ impl ClipboardProvider {
     ) -> Self {
         let configured = &definition.definition().provider;
         let languages = &definition.definition().languages;
+        let url_template = &definition.definition().request.url;
+        let configured_origin = (!is_loopback_url(url_template))
+            .then(|| automatic_https_origin_from_template(url_template))
+            .flatten();
         let mut capabilities = TranslatorCapabilities::new(TranslatorKind::Remote);
         capabilities.id = configured.id.clone();
         capabilities.name = configured.name.clone();
@@ -108,6 +114,8 @@ impl ClipboardProvider {
         Self {
             enabled: configured.enabled,
             automatic: configured.auto_translate,
+            configured_origin,
+            approved_origin: None,
             provider: definition,
             capabilities,
             local_endpoint: None,
@@ -125,6 +133,14 @@ impl ClipboardProvider {
 
     pub(super) fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(super) fn consent_origin(&self) -> Option<&str> {
+        if self.enabled && self.automatic {
+            self.configured_origin.as_deref()
+        } else {
+            None
+        }
     }
 
     pub(super) fn translate(
@@ -167,6 +183,17 @@ impl ClipboardProvider {
                 _ => format!("{reason:?}"),
             };
             return self.report_skipped(id, &detail, history, output);
+        }
+        if mode == RequestMode::Automatic
+            && self.consent_origin().is_some()
+            && self.approved_origin.is_none()
+        {
+            return self.report_skipped(
+                id,
+                "automatic off-device sending needs confirmation",
+                history,
+                output,
+            );
         }
         if let Some(active) = &self.active
             && active.mode == RequestMode::Automatic
@@ -264,6 +291,7 @@ impl ClipboardProvider {
         let provider = self.provider.clone();
         let languages = (self.source.clone(), self.target.clone());
         let endpoint = self.local_endpoint.clone();
+        let approved_origin = self.approved_origin.clone();
         let read_key = self.read_key;
         let worker = thread::Builder::new()
             .name(self.capabilities.id.clone())
@@ -302,8 +330,10 @@ impl ClipboardProvider {
                             )
                             .map_err(|error| format!("error ({error})"))?
                         };
-                        if mode == RequestMode::Automatic && !is_loopback_url(&request.url) {
-                            return Err("automatic sending requires a loopback endpoint".into());
+                        if mode == RequestMode::Automatic
+                            && !permits_automatic_url(&request.url, approved_origin.as_deref())
+                        {
+                            return Err("automatic off-device sending needs confirmation for a fixed HTTPS origin".into());
                         }
                         requests.push(request);
                     }
@@ -507,4 +537,10 @@ impl ClipboardProvider {
         );
         Ok(())
     }
+}
+
+pub(super) fn permits_automatic_url(url: &str, approved_origin: Option<&str>) -> bool {
+    is_loopback_url(url)
+        || approved_origin
+            .is_some_and(|approved| automatic_https_origin(url).as_deref() == Some(approved))
 }
