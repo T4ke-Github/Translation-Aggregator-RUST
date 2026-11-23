@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 ta-core.workspace = true
 toml = "1.2"
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
